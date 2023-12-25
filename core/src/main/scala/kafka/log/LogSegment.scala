@@ -41,15 +41,26 @@ import scala.math._
  * segment has a base offset which is an offset <= the least offset of any message in this segment and > any offset in
  * any previous segment.
  *
+ * 日志的 segment。每个 segment 都有两个组件：日志和索引。
+ * 日志是一个包含实际消息的 FileRecords。
+ * 索引是一个将逻辑偏移映射到物理文件位置的 OffsetIndex 。
+ * 每个 segment 都有一个基础偏移 base_offset，它小于当前 segment 中所有消息的最小偏移，并且大于之前所有 segment 的偏移。
+ *
  * A segment with a base offset of [base_offset] would be stored in two files, a [base_offset].index and a [base_offset].log file.
+ *
+ * segment 信息会被存在两个文件中，即：
+ * [base_offset].index
+ * [base_offset].log
  *
  * @param log The file records containing log entries
  * @param lazyOffsetIndex The offset index
  * @param lazyTimeIndex The timestamp index
  * @param txnIndex The transaction index
  * @param baseOffset A lower bound on the offsets in this segment
- * @param indexIntervalBytes The approximate number of bytes between entries in the index
+ * @param indexIntervalBytes The approximate number of bytes between entries in the index:
+ *                           对应 Broker 端参数 log.index.interval.bytes。默认情况下，日志段至少新写入 4KB 的消息数据才会新增一条索引项。
  * @param rollJitterMs The maximum random jitter subtracted from the scheduled segment roll time
+ *                     随机时间差，每个新增日志段在创建时会彼此岔开一小段时间，这样可以降低物理磁盘的 I/O 负载。
  * @param time The time instance
  */
 @nonthreadsafe
@@ -132,9 +143,12 @@ class LogSegment private[log] (val log: FileRecords,
    * an entry to the index if needed.
    *
    * It is assumed this method is being called from within a lock.
+   * 假定这个方法是在 lock 中执行
    *
    * @param largestOffset The last offset in the message set
+   *                      message set 中最后一条消息的 offset
    * @param largestTimestamp The largest timestamp in the message set.
+   *                         message set 中最大的 ts
    * @param shallowOffsetOfMaxTimestamp The offset of the message that has the largest timestamp in the messages to append.
    * @param records The log entries to append.
    * @return the physical position in the file of the appended records
@@ -150,22 +164,37 @@ class LogSegment private[log] (val log: FileRecords,
             s"with largest timestamp $largestTimestamp at shallow offset $shallowOffsetOfMaxTimestamp")
       val physicalPosition = log.sizeInBytes()
       if (physicalPosition == 0)
+        // used for time based log rolling and for ensuring max compaction delay
         rollingBasedTimestamp = Some(largestTimestamp)
 
+      // 确保 (largestOffset - baseOffset) > 0 且 < Int.Max
       ensureOffsetInRange(largestOffset)
 
       // append the messages
+      // 注意一个 FileRecords 中，最多保存 Int.Max bytes 的数据，如果超了，这一步会抛出 IllegalArgumentException
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
+
       // Update the in memory max timestamp and corresponding offset.
+      // 如果插入数据的最后一条的 timestamp，比 timeIndex 中最后一条记录的时间戳大，则：
+      // 更新内存中记录着的 timeIndex 中最后一条的记录对应的 时间戳
+      // 更新内存中记录着的 timeIndex 中最后一条的记录对应的 offset
       if (largestTimestamp > maxTimestampSoFar) {
         maxTimestampSoFar = largestTimestamp
         offsetOfMaxTimestampSoFar = shallowOffsetOfMaxTimestamp
       }
+
       // append an entry to the index (if needed)
+      // 日志段至少新写入 indexIntervalBytes 的消息数据才会新增一条索引项
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
+        // physicalPosition: 当前日志总 Bytes
+        // largestOffset: message set 中最后一条消息的 offset
+        // 这两个数字，会以两个 Int 的形式 append 到 offsetIndex 中，这对应着 offsetIndex 中的 entrySize = 8Bytes
         offsetIndex.append(largestOffset, physicalPosition)
+        // 只有本次的 ts 和 offset 都比上一次的大的时候，才会真正 append
+        // 这两个数字，会以一个 Int 一个 Long 的形式 append 到 timeIndex 中，这对应着 timeIndex 中的 entrySize = 12Bytes
         timeIndex.maybeAppend(maxTimestampSoFar, offsetOfMaxTimestampSoFar)
+        // 重置计数器
         bytesSinceLastIndexEntry = 0
       }
       bytesSinceLastIndexEntry += records.sizeInBytes

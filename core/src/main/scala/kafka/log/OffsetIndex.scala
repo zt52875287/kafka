@@ -141,12 +141,14 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
   def append(offset: Long, position: Int): Unit = {
     inLock(lock) {
       require(!isFull, "Attempt to append to a full index (size = " + _entries + ").")
+      // 如果一条数据都没有，直接 put || 如果 offset 合法，则可以 put
       if (_entries == 0 || offset > _lastOffset) {
         trace(s"Adding index entry $offset => $position to ${file.getAbsolutePath}")
         mmap.putInt(relativeOffset(offset))
         mmap.putInt(position)
         _entries += 1
         _lastOffset = offset
+        // 防御性编程，确保增加一个 entry(put 两个 Int)之后，mmap 的 position 是正确的
         require(_entries * entrySize == mmap.position(), s"$entries entries but file position in index is ${mmap.position()}.")
       } else {
         throw new InvalidOffsetException(s"Attempt to append an offset ($offset) to position $entries no larger than" +
