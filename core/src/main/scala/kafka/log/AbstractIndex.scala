@@ -48,35 +48,50 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
   /*
    Kafka mmaps index files into memory, and all the read / write operations of the index is through OS page cache. This
    avoids blocked disk I/O in most cases.
+   Kafka mmaps 将索引文件映射到内存中，索引的所有读写操作都通过操作系统的 page cache 进行。这避免了大多数场景下的阻塞磁盘I/O。
 
    To the extent of our knowledge, all the modern operating systems use LRU policy or its variants to manage page
    cache. Kafka always appends to the end of the index file, and almost all the index lookups (typically from in-sync
    followers or consumers) are very close to the end of the index. So, the LRU cache replacement policy should work very
    well with Kafka's index access pattern.
+   据我们所知，所有现代操作系统都使用 LRU 策略或其变体来管理 page cache。Kafka 始终将数据追加到索引文件的末尾，而几乎所有的索引查找
+   （通常来自 in-sync followers 或者 consumers）都非常接近索引的末尾。因此，LRU 应该很好地适应Kafka的索引访问模式。
 
    However, when looking up index, the standard binary search algorithm is not cache friendly, and can cause unnecessary
    page faults (the thread is blocked to wait for reading some index entries from hard disk, as those entries are not
    cached in the page cache).
+   然而，在查找索引时，标准的二分查找对缓存并不友好，还有可能导致不必要的 page faults（线程由于等待一些未在 page cache 中（实际是在硬盘）的索引条目而被阻塞）。
 
    For example, in an index with 13 pages, to lookup an entry in the last page (page #12), the standard binary search
    algorithm will read index entries in page #0, 6, 9, 11, and 12.
+   例如，在一个包含13个页的索引中，查找最后一页中的条目，标准的二分查找将读取第0、6、9、11、12页的索引条目。
+
    page number: |0|1|2|3|4|5|6|7|8|9|10|11|12 |
    steps:       |1| | | | | |3| | |4|  |5 |2/6|
+
    In each page, there are hundreds log entries, corresponding to hundreds to thousands of kafka messages. When the
    index gradually growing from the 1st entry in page #12 to the last entry in page #12, all the write (append)
    operations are in page #12, and all the in-sync follower / consumer lookups read page #0,6,9,11,12. As these pages
    are always used in each in-sync lookup, we can assume these pages are fairly recently used, and are very likely to be
    in the page cache. When the index grows to page #13, the pages needed in a in-sync lookup change to #0, 7, 10, 12,
    and 13:
+   在每一页中，有数百个日志条目，对应于几百上千条Kafka消息。当索引从第12页的第一个条目逐渐增长到第12页的最后一个条目时，
+   所有的写入（追加）操作都在第12页，而所有的 in-sync follower / consumer 查找时都要读取第0、6、9、11、12页。
+   当索引增长到第13页时， in-sync 查找所需的页面变为第0、7、10、12和13页：
+
    page number: |0|1|2|3|4|5|6|7|8|9|10|11|12|13 |
    steps:       |1| | | | | | |3| | | 4|5 | 6|2/7|
+
    Page #7 and page #10 have not been used for a very long time. They are much less likely to be in the page cache, than
    the other pages. The 1st lookup, after the 1st index entry in page #13 is appended, is likely to have to read page #7
    and page #10 from disk (page fault), which can take up to more than a second. In our test, this can cause the
    at-least-once produce latency to jump to about 1 second from a few ms.
+   第7页和第10页长时间未被使用。相比其他页，它们不太可能存在于 page cache。而在第13页的第一个索引条目附加后的第一个查找，
+   可能必须从磁盘读取第7页和第10页，这可能需要超过一秒。在我们的测试中，这会导致至少一次秒级的 produce 延迟。
 
    Here, we use a more cache-friendly lookup algorithm:
-   if (target > indexEntry[end - N]) // if the target is in the last N entries of the index
+   所以我们使用一种对缓存更友好的查找算法：
+   if (target > indexEntry[end - N]) // if the target is in the last N entries of the index 如果查询的目标在索引的最后 N 个 entries 中
       binarySearch(end - N, end)
    else
       binarySearch(begin, end - N)
@@ -84,8 +99,21 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
    If possible, we only look up in the last N entries of the index. By choosing a proper constant N, all the in-sync
    lookups should go to the 1st branch. We call the last N entries the "warm" section. As we frequently look up in this
    relatively small section, the pages containing this section are more likely to be in the page cache.
+   如果可能，我们只在索引的最后N个条目中查找。通过选择适当的常数N，所有的同步查找应该都进入第一个分支。我们称最后N个条目为“热”部分。
+   由于我们经常在这个相对较小的部分中查找，包含该部分的 page 更有可能存在于 page cache 中。
 
    We set N (_warmEntries) to 8192, because
+   我们将 N 设置为 8192，因为：
+   1. 这个数字足够小，可以确保每次 warm 查询，都会访问所有的 warm-section。这样，warm-section 才配被称为 warm。
+      在 warm-section 查找时，会始终访问下面三个 entry：
+      indexEntry(end)
+      indexEntry(end-N)
+      indexEntry((end*2 -N)/2)
+      如果页面大小>=4096，当我们触及这3个条目时，所有 warm-section page（3个或更少（最后一页并不总是满的，所以是3个或更少））都会被访问。截至2018年，
+      4096是所有处理器（x86-32、x86-64、MIPS、SPARC、Power、ARM等）的最小页面大小。
+   2. 这个数字足够大，以确保大多数 in-sync lookups 都在 warm-section 进行。
+      在Kafka默认设置下，8KB索引对应于约4MB（offset index）或2.7MB（time index）的日志消息。
+
    1. This number is small enough to guarantee all the pages of the "warm" section is touched in every warm-section
       lookup. So that, the entire warm section is really "warm".
       When doing warm-section lookup, following 3 entries are always touched: indexEntry(end), indexEntry(end-N),
@@ -97,10 +125,15 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
 
    We can't set make N (_warmEntries) to be larger than 8192, as there is no simple way to guarantee all the "warm"
    section pages are really warm (touched in every lookup) on a typical 4KB-page host.
+   我们不能将N（_warmEntries）设置为大于8192，因为在典型的4KB页面主机上，没有简单的方法来确保所有 "warm"
+   section pages 都是真正 warm 的（在每次查找中都被访问）。
 
    In there future, we may use a backend thread to periodically touch the entire warm section. So that, we can
    1) support larger warm section
    2) make sure the warm section of low QPS topic-partitions are really warm.
+   在将来，我们可能会使用后台线程定期访问整个“热”部分。这样，我们可以：
+   1）支持更大的“热”部分
+   2）确保低 QPS 主题分区的 warm section 确实是“热”的。
  */
   protected def _warmEntries: Int = 8192 / entrySize
 
@@ -115,12 +148,23 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
       if(newlyCreated) {
         if(maxIndexSize < entrySize)
           throw new IllegalArgumentException("Invalid max index size: " + maxIndexSize)
+        // 先将 maxIndexSize 变为 entrySize 的整数倍，然后设置为 mmap 的 limit(大小)，其实就是 RandomAccessFile 的文件大小
         raf.setLength(roundDownToExactMultiple(maxIndexSize, entrySize))
       }
 
       /* memory-map the file */
       _length = raf.length()
       val idx = {
+        // FileChannel.map 方法： FileChannelImpl 中通过反射的方式，调用：
+        // java.nio.DirectByteBuffer.DirectByteBuffer(int, long, java.io.FileDescriptor, java.lang.Runnable)
+        // 构造出来 MappedByteBuffer。
+        //
+        // length 来自于当前对象 AbstractIndex 的构造方法的入参，对应 kafka 配置项：log.index.size.max.bytes
+        // 它的默认值 LogIndexSizeMaxBytes = 10*1024*1024
+        //
+        // 我们据此可已计算出：
+        // OffsetIndex 最多可以存储 10*1024*1024/8 = 1310720 条数据
+        // TimeIndex 最多可以存储 10*1024*1024(先缩减到12的倍数)/12 = 873813 条数据
         if (writable)
           raf.getChannel.map(FileChannel.MapMode.READ_WRITE, 0, _length)
         else
@@ -129,9 +173,12 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
       /* set the position in the index for the next entry */
       if(newlyCreated)
         idx.position(0)
-      else
+      else {
         // if this is a pre-existing index, assume it is valid and set position to last entry
+        // 如果是已存在的 file 映射出的 MappedByteBuffer, 我们且认为他是有效的，把 position 放到整个文件的最后
+        // (表示当前文件已满，这样，再有新增的条目的话，就不会破坏原来的文件，而是重新新增 index)
         idx.position(roundDownToExactMultiple(idx.limit(), entrySize))
+      }
       idx
     } finally {
       CoreUtils.swallow(raf.close(), AbstractIndex)
@@ -168,6 +215,11 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
    * trimToValidSize() which is called at closing the segment or new segment being rolled; (2) at
    * loading segments from disk or truncating back to an old segment where a new log segment became active;
    * we want to reset the index size to maximum index size to avoid rolling new segment.
+   *
+   * 重置 memory map(mmap) 和 file 的大小，两种使用场景：
+   * 1. 在调用 trimToValidSize() 关闭 segment 或 创建新 segment 时；
+   * 2. 在从磁盘加载 segment, 或截断回到旧段(truncating back to an old segment)的情况下，其中新的日志段变为活动状态；
+   * 我们希望将索引大小重置为最大索引大小，以避免滚动新 segment
    *
    * @param newSize new size of the index file
    * @return a boolean indicating whether the size of the memory map and the underneath file is changed or not.
@@ -355,6 +407,10 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
    * Find the slot in which the largest entry less than or equal to the given target key or value is stored.
    * The comparison is made using the `IndexEntry.compareTo()` method.
    *
+   * 找到索引文件中 offset 刚好 <= target 的那一个
+   * 如果 target 比索引文件中所有的都大，就返回索引的最后一项
+   * 如果 target 比索引文件中所有的都小，就返回 -1
+   *
    * @param idx The index buffer
    * @param target The index key to look for
    * @return The slot found or -1 if the least entry in the index is larger than the target key or the index is empty
@@ -364,6 +420,11 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
 
   /**
    * Find the smallest entry greater than or equal the target key or value. If none can be found, -1 is returned.
+   *
+   * 找到索引文件中 position 刚好 >= target(physical position) 的那一个
+   * 如果 target 比索引文件中所有的都小，就返回 0
+   * 如果 target 比索引文件中所有的都大，就返回 -1
+   *
    */
   protected def smallestUpperBoundSlotFor(idx: ByteBuffer, target: Long, searchEntity: IndexSearchEntity): Int =
     indexSlotRangeFor(idx, target, searchEntity)._2
@@ -382,7 +443,10 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
       var hi = end
       while(lo < hi) {
         val mid = (lo + hi + 1) >>> 1
+        // 把数组下标，转化为 offset
         val found = parseEntry(idx, mid)
+        // 这里是 java.lang.Long.compare
+        // 根据 searchEntity = key/value，比较 index 的 logical log offset 或者 physical position
         val compareResult = compareIndexEntry(found, target, searchEntity)
         if(compareResult > 0)
           hi = mid - 1
@@ -394,16 +458,23 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
       (lo, if (lo == _entries - 1) -1 else lo + 1)
     }
 
+    // 找到第一条 warm entry(warm entry 在 page cache 中，访问起来比较快)
     val firstHotEntry = Math.max(0, _entries - 1 - _warmEntries)
+
     // check if the target offset is in the warm section of the index
+    // 如果 target 处在 warm section，即 firstHotEntry 比 target 小，直接在 warm section 二分查找就可以
     if(compareIndexEntry(parseEntry(idx, firstHotEntry), target, searchEntity) < 0) {
+      // 找到就返回 (target, target)，找不到就返回 (_entries-1, -1)
       return binarySearch(firstHotEntry, _entries - 1)
     }
 
     // check if the target offset is smaller than the least offset
+    // 如果第一条 index 中记录的 offset 也比 target 大，说明不在当前 index 中
     if(compareIndexEntry(parseEntry(idx, 0), target, searchEntity) > 0)
       return (-1, 0)
 
+    // 如果 target 在 cold section，直接二分查找
+    // 找到就返回 (target, target)，找不到就返回 (0, 1)
     binarySearch(0, firstHotEntry)
   }
 

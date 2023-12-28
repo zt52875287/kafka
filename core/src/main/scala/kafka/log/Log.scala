@@ -293,6 +293,7 @@ class Log(@volatile private var _dir: File,
 
   locally {
     // create the log directory if it doesn't exist
+    // 创建目录
     Files.createDirectories(dir.toPath)
 
     initializeLeaderEpochCache()
@@ -580,15 +581,20 @@ class Log(@volatile private var _dir: File,
         throw new IOException(s"Could not read file $file")
       val filename = file.getName
       if (filename.endsWith(DeletedFileSuffix)) {
+        // 删除准备删除但还没删除的文件（以 .deleted 结尾）
         debug(s"Deleting stray temporary file ${file.getAbsolutePath}")
         Files.deleteIfExists(file.toPath)
       } else if (filename.endsWith(CleanedFileSuffix)) {
+        // 收集 log clean 用到的临时文件
         minCleanedFileOffset = Math.min(offsetFromFileName(filename), minCleanedFileOffset)
         cleanFiles += file
       } else if (filename.endsWith(SwapFileSuffix)) {
         // we crashed in the middle of a swap operation, to recover:
         // if a log, delete the index files, complete the swap operation later
         // if an index just delete the index files, they will be rebuilt
+        // 如果有 .swap 文件，说明我们在执行 swap operation 的时候宕机了，为了恢复：
+        // 如果是 log，就删除索引文件，稍后再做 swap operation
+        // 如果是 index(offsetIndex/timeIndex/txnIndex)，直接删了就可以了，稍后会被重建的
         val baseFile = new File(CoreUtils.replaceSuffix(file.getPath, SwapFileSuffix, ""))
         info(s"Found file ${file.getAbsolutePath} from interrupted swap operation.")
         if (isIndexFile(baseFile)) {
@@ -603,6 +609,9 @@ class Log(@volatile private var _dir: File,
     // KAFKA-6264: Delete all .swap files whose base offset is greater than the minimum .cleaned segment offset. Such .swap
     // files could be part of an incomplete split operation that could not complete. See Log#splitOverflowedSegment
     // for more details about the split operation.
+    //
+    // 删除所有 baseOffset(文件名中的数字) 大于等于 minimum .cleaned segment offset 的 .swap 文件。
+    // 这些 .swap 文件可能是由于一些没法成功执行的 split operation 造成的，没的救了，所以直接删掉。
     val (invalidSwapFiles, validSwapFiles) = swapFiles.partition(file => offsetFromFile(file) >= minCleanedFileOffset)
     invalidSwapFiles.foreach { file =>
       debug(s"Deleting invalid swap file ${file.getAbsoluteFile} minCleanedFileOffset: $minCleanedFileOffset")
@@ -612,11 +621,13 @@ class Log(@volatile private var _dir: File,
     }
 
     // Now that we have deleted all .swap files that constitute an incomplete split operation, let's delete all .clean files
+    // 到这里 .cleaned 文件的作用就没了，直接删除
     cleanFiles.foreach { file =>
       debug(s"Deleting stray .clean file ${file.getAbsolutePath}")
       Files.deleteIfExists(file.toPath)
     }
 
+    // 返回有效的可恢复的 swap 文件列表
     validSwapFiles
   }
 
@@ -730,6 +741,7 @@ class Log(@volatile private var _dir: File,
   private def loadSegments(): Long = {
     // first do a pass through the files in the log directory and remove any temporary files
     // and find any interrupted swap operations
+    // 清理所有的 .swap 文件，重新创建 .swap 文件
     val swapFiles = removeTempFilesAndCollectSwapFiles()
 
     // Now do a second pass and load all the log and index files.
@@ -2427,11 +2439,24 @@ class Log(@volatile private var _dir: File,
    * resulting segments will contain the exact same messages that are present in the input segment. On successful
    * completion of this method, the input segment will be deleted and will be replaced by the resulting new segments.
    * See replaceSegments for recovery logic, in case the broker dies in the middle of this operation.
+   *
+   * 将一个 segment 分割成一个或多个新的 segment，以确保它们中没有任何 offset 溢出。
+   * 这个方法执行完之后，输入的 segment 将被删除，并将被新生成的 segment 所替代；
+   * 在方法的执行过程中，如果 broker 宕机，可以通过 replaceSegments 来恢复。
+   *
    * <p>Note that this method assumes we have already determined that the segment passed in contains records that cause
    * offset overflow.</p>
+   *
+   * 注意，这个方法假定 segment 确实已经发生了 offset overflow
+   *
    * <p>The split logic overloads the use of .clean files that LogCleaner typically uses to make the process of replacing
    * the input segment with multiple new segments atomic and recoverable in the event of a crash. See replaceSegments
    * and completeSwapOperations for the implementation to make this operation recoverable on crashes.</p>
+   *
+   * 分割逻辑使用了 LogCleaner 通常使用的 .clean 文件的分割逻辑。
+   * 这个逻辑用于使用多个新的 segments 替换 input segment 的过程具有原子性，并且在发生崩溃时能够进行恢复。
+   * 可以参考 replaceSegments 和 completeSwapOperations 的实现，了解在程序 crash 的情况下可恢复性是如何保证的。
+   *
    * @param segment Segment to split
    * @return List of new segments that replace the input segment
    */
@@ -2446,15 +2471,20 @@ class Log(@volatile private var _dir: File,
       var position = 0
       val sourceRecords = segment.log
 
+      // 将原 segment 拆分成多个合法的 segment
+      // 方法假定入参一定是合法的(segment 一定是 overflow)，所以原 segment 至少会被拆成两个 newSegment
       while (position < sourceRecords.sizeInBytes) {
         val firstBatch = sourceRecords.batchesFrom(position).asScala.head
+        // 为当前新建一个临时 segment 文件，后缀是 .cleaned
         val newSegment = LogCleaner.createNewCleanedSegment(this, firstBatch.baseOffset)
         newSegments += newSegment
 
+        // 根据 position 将 segment 中的内容写到 newSegment 中
         val bytesAppended = newSegment.appendFromFile(sourceRecords, position)
         if (bytesAppended == 0)
           throw new IllegalStateException(s"Failed to append records from position $position in $segment")
 
+        // 累加 position，循环，直到 segment 中的所有内容都被写到 newSegment 中
         position += bytesAppended
       }
 

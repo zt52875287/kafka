@@ -104,6 +104,7 @@ class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable:
    * Attempt to append a time index entry to the time index.
    * The new entry is appended only if both the timestamp and offsets are greater than the last appended timestamp and
    * the last appended offset.
+   * 只有本次的 ts > 上一次 并且 offset >= 上一次的时候，才会真正 append。为什么呢？先记一个 todo
    *
    * @param timestamp The timestamp of the new time index entry
    * @param offset The offset of the new time index entry
@@ -116,10 +117,18 @@ class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable:
         require(!isFull, "Attempt to append to a full time index (size = " + _entries + ").")
       // We do not throw exception when the offset equals to the offset of last entry. That means we are trying
       // to insert the same time index entry as the last entry.
+      // 偏移量等于最后条目的偏移量时不抛出异常。这意味着试图插入与最后条目相同的时间索引。
+      //
       // If the timestamp index entry to be inserted is the same as the last entry, we simply ignore the insertion
       // because that could happen in the following two scenarios:
+      // 我们只是忽略插入，因为这可能发生在以下两种情况下：
+      //
       // 1. A log segment is closed.
       // 2. LogSegment.onBecomeInactiveSegment() is called when an active log segment is rolled.
+      // 1. 日志段已关闭。
+      // 2. 在激活的日志段变为关闭时调用了 LogSegment.onBecomeInactiveSegment()。这会给 timeIndex 最后 append 一个 segment 中
+      //    最大的时间戳，这个时间戳用来决定什么时候删除这个 segment。
+
       if (_entries != 0 && offset < lastEntry.offset)
         throw new InvalidOffsetException(s"Attempt to append an offset ($offset) to slot ${_entries} no larger than" +
           s" the last offset appended (${lastEntry.offset}) to ${file.getAbsolutePath}.")

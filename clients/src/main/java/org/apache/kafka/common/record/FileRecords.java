@@ -155,11 +155,13 @@ public class FileRecords extends AbstractRecords implements Closeable {
     /**
      * Append a set of records to the file. This method is not thread-safe and must be
      * protected with a lock.
+     * 把一堆 records append 到文件中；需要注意的是这个方法不是线程安全的。
      *
      * @param records The records to append
      * @return the number of bytes written to the underlying file
      */
     public int append(MemoryRecords records) throws IOException {
+        // 一个 FileRecords 最多 hold Int.Max bytes 数据
         if (records.sizeInBytes() > Integer.MAX_VALUE - size.get())
             throw new IllegalArgumentException("Append of size " + records.sizeInBytes() +
                     " bytes is too large for segment with current file position at " + size.get());
@@ -294,6 +296,8 @@ public class FileRecords extends AbstractRecords implements Closeable {
      * Search forward for the file position of the last offset that is greater than or equal to the target offset
      * and return its physical position and the size of the message (including log overhead) at the returned offset. If
      * no such offsets are found, return null.
+     *
+     * 从指定的 startingPosition 开始，查找 targetOffset 所在的文件块(FileChannelRecordBatch)的位置和大小
      *
      * @param targetOffset The offset to search for.
      * @param startingPosition The starting position in the file to begin searching from.

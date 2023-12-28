@@ -95,7 +95,7 @@ object Defaults {
 
   /** ********* Log Configuration ***********/
   val NumPartitions = 1
-  val LogDir = "/tmp/kafka-logs"
+  val LogDir = "C:/Users/zhangtong/Desktop/logdir/kafka"
   val LogSegmentBytes = 1 * 1024 * 1024 * 1024
   val LogRollHours = 24 * 7
   val LogRollJitterHours = 0
