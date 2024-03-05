@@ -149,10 +149,10 @@ class LogSegment private[log] (val log: FileRecords,
    * It is assumed this method is being called from within a lock.
    * 假定这个方法是在 lock 中执行
    *
-   * @param largestOffset The last offset in the message set
-   *                      message set 中最后一条消息的 offset
-   * @param largestTimestamp The largest timestamp in the message set.
-   *                         message set 中最大的 ts
+   * @param largestOffset               The last offset in the message set
+   *                                    message set 中最后一条消息的 offset
+   * @param largestTimestamp            The largest timestamp in the message set.
+   *                                    message set 中最大的 ts
    * @param shallowOffsetOfMaxTimestamp The offset of the message that has the largest timestamp in the messages to append.
    * @param records The log entries to append.
    * @return the physical position in the file of the appended records
@@ -330,10 +330,10 @@ class LogSegment private[log] (val log: FileRecords,
    * 从 segment 的开头，读取 message set。
    * message set 的大小可以通过 maxSize bytes 和 maxOffset(maxPosition) 来限制。
    *
-   * @param startOffset A lower bound on the first offset to include in the message set we read
-   *                    消息的 offset
-   * @param maxSize The maximum number of bytes to include in the message set we read
-   * @param maxPosition The maximum position in the log segment that should be exposed for read
+   * @param startOffset   A lower bound on the first offset to include in the message set we read
+   *                      消息的 offset
+   * @param maxSize       The maximum number of bytes to include in the message set we read
+   * @param maxPosition   The maximum position in the log segment that should be exposed for read
    * @param minOneMessage If this is true, the first message will be returned even if it exceeds `maxSize` (if one exists)
    *                      是否允许在消息体过大时，至少返回一条消息，防止消费者永远空转
    *
@@ -374,7 +374,7 @@ class LogSegment private[log] (val log: FileRecords,
     // 用 maxPosition 约束将要读取的文件大小
     val fetchSize: Int = min((maxPosition - startPosition).toInt, adjustedMaxSize)
 
-    // 这里是从原始 log 文件中，标记一块内容(一批 record)出来，startOffset 就在这一块内容中
+    // 这里是从原始 log 文件中，标记一块内容(一批 record)出来，startOffset 就是其中的第一条
     FetchDataInfo(offsetMetadata, log.slice(startPosition, fetchSize),
       firstEntryIncomplete = adjustedMaxSize < startOffsetAndSize.size)
   }

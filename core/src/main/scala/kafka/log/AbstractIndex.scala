@@ -60,7 +60,8 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
    However, when looking up index, the standard binary search algorithm is not cache friendly, and can cause unnecessary
    page faults (the thread is blocked to wait for reading some index entries from hard disk, as those entries are not
    cached in the page cache).
-   然而，在查找索引时，标准的二分查找对缓存并不友好，还有可能导致不必要的 page faults（线程由于等待一些未在 page cache 中（实际是在硬盘）的索引条目而被阻塞）。
+   然而，在查找索引时，标准的二分查找对缓存并不友好，还有可能导致不必要的 page faults
+   （线程由于等待一些未在 page cache 中（实际是在硬盘）的索引条目而被阻塞）。
 
    For example, in an index with 13 pages, to lookup an entry in the last page (page #12), the standard binary search
    algorithm will read index entries in page #0, 6, 9, 11, and 12.
@@ -91,7 +92,8 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
 
    Here, we use a more cache-friendly lookup algorithm:
    所以我们使用一种对缓存更友好的查找算法：
-   if (target > indexEntry[end - N]) // if the target is in the last N entries of the index 如果查询的目标在索引的最后 N 个 entries 中
+   if (target > indexEntry[end - N])
+      // if the target is in the last N entries of the index 如果查询的目标在索引的最后 N 个 entries 中
       binarySearch(end - N, end)
    else
       binarySearch(begin, end - N)
@@ -103,16 +105,18 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
    由于我们经常在这个相对较小的部分中查找，包含该部分的 page 更有可能存在于 page cache 中。
 
    We set N (_warmEntries) to 8192, because
-   我们将 N 设置为 8192，因为：
+   我们将计算 N 所用的常数设置为 8192 Bytes，因为：
    1. 这个数字足够小，可以确保每次 warm 查询，都会访问所有的 warm-section。这样，warm-section 才配被称为 warm。
       在 warm-section 查找时，会始终访问下面三个 entry：
       indexEntry(end)
       indexEntry(end-N)
-      indexEntry((end*2 -N)/2)
-      如果页面大小>=4096，当我们触及这3个条目时，所有 warm-section page（3个或更少（最后一页并不总是满的，所以是3个或更少））都会被访问。截至2018年，
-      4096是所有处理器（x86-32、x86-64、MIPS、SPARC、Power、ARM等）的最小页面大小。
+      indexEntry((end-N+end)/2)
+      如果页面大小>=4096，当我们触及这3个条目时，所有 warm-section page（3个或更少（最后一页并不总是满的，所以是3个或更少））都会被访问。
+      截至2018年，4096Bytes 是所有处理器（x86-32、x86-64、MIPS、SPARC、Power、ARM等）的最小页面大小。
    2. 这个数字足够大，以确保大多数 in-sync lookups 都在 warm-section 进行。
-      在Kafka默认设置下，8KB索引对应于约4MB（offset index）或2.7MB（time index）的日志消息。
+      在Kafka默认设置下，
+      8KB 索引对应于 1024 条 offsetIndex, 由于每 4KB 日志原文会新增一条索引，所以可以检索出   4MB 的日志原文
+      8KB 索引对应于  682 条   timeIndex, 由于每 4KB 日志原文会新增一条索引，所以可以检索出 2.7MB 的日志原文。
 
    1. This number is small enough to guarantee all the pages of the "warm" section is touched in every warm-section
       lookup. So that, the entire warm section is really "warm".
@@ -125,7 +129,7 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
 
    We can't set make N (_warmEntries) to be larger than 8192, as there is no simple way to guarantee all the "warm"
    section pages are really warm (touched in every lookup) on a typical 4KB-page host.
-   我们不能将N（_warmEntries）设置为大于8192，因为在典型的4KB页面主机上，没有简单的方法来确保所有 "warm"
+   我们不能将这个常数设置为大于8192，因为在典型的4KB页面主机上，没有简单的方法来确保所有 "warm"
    section pages 都是真正 warm 的（在每次查找中都被访问）。
 
    In there future, we may use a backend thread to periodically touch the entire warm section. So that, we can
@@ -135,6 +139,8 @@ abstract class AbstractIndex(@volatile private var _file: File, val baseOffset: 
    1）支持更大的“热”部分
    2）确保低 QPS 主题分区的 warm section 确实是“热”的。
  */
+  // entrySize 在子类中有具体的定义，offsetIndex 中是 8Bytes/条，timeIndex 中是 12Bytes/条
+  // 这里 _warmEntries 的单位是 条，所以，8192 的单位就是 Bytes
   protected def _warmEntries: Int = 8192 / entrySize
 
   protected val lock = new ReentrantLock
