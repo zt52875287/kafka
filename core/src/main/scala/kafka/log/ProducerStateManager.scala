@@ -82,6 +82,10 @@ private[log] case class BatchMetadata(lastSeq: Int, lastOffset: Long, offsetDelt
 // the batchMetadata is ordered such that the batch with the lowest sequence is at the head of the queue while the
 // batch with the highest sequence is at the tail of the queue. We will retain at most ProducerStateEntry.NumBatchesToRetain
 // elements in the queue. When the queue is at capacity, we remove the first element to make space for the incoming batch.
+
+// 保存着 producer 信息，以及最近写入的 5 个(ProducerStateEntry.NumBatchesToRetain 个) batch 的数据的信息
+// 包括 firstSeq，lastSeq，firstOffset，lastOffset，以及 timestamp
+
 private[log] class ProducerStateEntry(val producerId: Long,
                                       val batchMetadata: mutable.Queue[BatchMetadata],
                                       var producerEpoch: Short,
@@ -468,6 +472,8 @@ object ProducerStateManager {
  * Maintains a mapping from ProducerIds to metadata about the last appended entries (e.g.
  * epoch, sequence number, last offset, etc.)
  *
+ * 维护一个从生产者 id 到其最近追加条目（如 epoch、sequence number、last offset 等）元数据的 map
+ *
  * The sequence number is the last number successfully appended to the partition for the given identifier.
  * The epoch is used for fencing against zombie writers. The offset is the one of the last successful message
  * appended to the partition.
@@ -479,6 +485,13 @@ object ProducerStateManager {
  * age. This ensures that producer ids will not be expired until either the max expiration time has been reached,
  * or if the topic also is configured for deletion, the segment containing the last written offset has
  * been deleted.
+ *
+ * 只要生产者 id 仍包含在此映射中，相应的生产者就可以继续写入数据。
+ * 除非生产者很久不写日志，或者写入的所有消息都被删除(retention policy=delete)，这个 id 就会过期。
+ *
+ * 对于压缩策略的主题，所有消息达到最大过期时间，ID就会过期
+ * 对于删除策略的主题，所有写入的消息被删除，ID就会过期
+ *
  */
 @nonthreadsafe
 class ProducerStateManager(val topicPartition: TopicPartition,

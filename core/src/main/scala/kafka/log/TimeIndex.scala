@@ -104,7 +104,7 @@ class TimeIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writable:
    * Attempt to append a time index entry to the time index.
    * The new entry is appended only if both the timestamp and offsets are greater than the last appended timestamp and
    * the last appended offset.
-   * 只有本次的 ts > 上一次 并且 offset >= 上一次的时候，才会真正 append。为什么呢？先记一个 todo
+   * 只有本次的 ts > 上一次 并且 offset >= 上一次的时候，才会 append。
    *
    * @param timestamp The timestamp of the new time index entry
    * @param offset The offset of the new time index entry

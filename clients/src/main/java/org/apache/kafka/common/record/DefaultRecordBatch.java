@@ -60,11 +60,18 @@ import static org.apache.kafka.common.record.Records.LOG_OVERHEAD;
  * Note that when compression is enabled (see attributes below), the compressed record data is serialized
  * directly following the count of the number of records.
  *
+ * 当启用了压缩时，压缩后的记录数据会直接 serialized 在记录数量之后
+ *
  * The CRC covers the data from the attributes to the end of the batch (i.e. all the bytes that follow the CRC). It is
  * located after the magic byte, which means that clients must parse the magic byte before deciding how to interpret
  * the bytes between the batch length and the magic byte. The partition leader epoch field is not included in the CRC
  * computation to avoid the need to recompute the CRC when this field is assigned for every batch that is received by
  * the broker. The CRC-32C (Castagnoli) polynomial is used for the computation.
+ *
+ * CRC校验覆盖从 attributes 开始到 batch 结尾的数据（即CRC之后的所有字节）。它位于 magic 字节之后，这意味着客户端必须先解析 magic 字节，
+ * 然后再决定如何解析 batch 长度和 magic 字节之间的字节。为了避免每次 broker 接收到 batch 时重新计算 CRC，
+ * 分区 leader 的 epoch 字段不包括在 CRC 中。
+ * CRC计算使用CRC-32C (Castagnoli)多项式。
  *
  * On Compaction: Unlike the older message formats, magic v2 and above preserves the first and last offset/sequence
  * numbers from the original batch when the log is cleaned. This is required in order to be able to restore the

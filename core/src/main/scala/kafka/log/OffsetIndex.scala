@@ -80,25 +80,31 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
    * Find the largest offset less than or equal to the given targetOffset
    * and return a pair holding this offset and its corresponding physical file position.
    *
-   * 根据相对位置 startOffset，找到真实的 offset，和在索引中的 physical position
+   * 在索引文件中查找 offset 刚好小于等于 targetOffset 的那一个
    *
    * @param targetOffset The offset to look up.
    *                     相对位置
    * @return The offset found and the corresponding file position for this offset
    *         If the target offset is smaller than the least entry in the index (or the index is empty),
    *         the pair (baseOffset, 0) is returned.
+   *         返回索引对应的 item 的 absolute offset 以及 physical position
    */
   def lookup(targetOffset: Long): OffsetPosition = {
     maybeLock(lock) {
       val idx = mmap.duplicate
+
       // 在索引文件中查找 offset 刚好小于等于 targetOffset 的那一个
-      // slot 是指 index entries 中的第几条
+      // （targetOffset 就是处于这个索引对应的数据块中）
+      // slot 是指索引在 offsetIndex 中的第几条
       val slot = largestLowerBoundSlotFor(idx, targetOffset, IndexSearchType.KEY)
-      if(slot == -1)
-        // 如果没找到，则说明 targetOffset 比索引文件中所有的都小，则返回(索引文件的起始 offset, 起始 physical position=0)
+
+      if (slot == -1)
+      // 如果没找到，则说明 targetOffset 比索引文件中所有的都小，则返回(索引文件的起始 offset, 起始 physical position=0)
         OffsetPosition(baseOffset, 0)
       else {
-        // 如果找到了，则返回(真正的 offset, targetOffset 在索引文件中的 physical position)
+        // 如果确定 targetOffset 在当前索引所对应的 log 中，则返回索引中存储的信息
+        // 1. 当前索引对应的 item 的绝对 offset
+        // 2. 当前索引对应的 item 在 log 文件中的物理位置
         parseEntry(idx, slot)
       }
     }
@@ -125,6 +131,7 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
   // +4 是因为 offset 和 position 连着的，这里要跳过 offset
   private def physical(buffer: ByteBuffer, n: Int): Int = buffer.getInt(n * entrySize + 4)
 
+  // 这里的 n 就是指，当前 offsetIndex 中的第 n 项（索引），里面存的是 item 的相对 offset值和物理位置
   override protected def parseEntry(buffer: ByteBuffer, n: Int): OffsetPosition = {
     // offset: 初始 offset 加上第 n 条 index 中保存的 offset 值
     OffsetPosition(baseOffset + relativeOffset(buffer, n), physical(buffer, n))
@@ -154,6 +161,8 @@ class OffsetIndex(_file: File, baseOffset: Long, maxIndexSize: Int = -1, writabl
       // 如果一条数据都没有，直接 put || 如果 offset 合法，则可以 put
       if (_entries == 0 || offset > _lastOffset) {
         trace(s"Adding index entry $offset => $position to ${file.getAbsolutePath}")
+
+        // 这里是将（相对于整个分区的）绝对 offset，转变为（相对于当前 segment 的）相对 offset，方便后续查找
         mmap.putInt(relativeOffset(offset))
         mmap.putInt(position)
         _entries += 1

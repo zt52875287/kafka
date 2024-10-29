@@ -38,6 +38,12 @@ object LogOffsetMetadata {
  *  2. the base message offset of the located segment
  *  3. the physical position on the located segment
  */
+
+// 封装着消息的位移信息，包括：
+// 1. 它的 offset
+// 2. 所处的 segment 的 baseOffset
+// 3. 所处的 segment 的日志文件的物理位置
+
 case class LogOffsetMetadata(messageOffset: Long,
                              segmentBaseOffset: Long = Log.UnknownOffset,
                              relativePositionInSegment: Int = LogOffsetMetadata.UnknownFilePosition) {

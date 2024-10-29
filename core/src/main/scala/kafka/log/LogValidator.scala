@@ -70,12 +70,24 @@ private[log] object LogValidator extends Logging {
    * 3. When magic value >= 1, validate and maybe overwrite timestamps of messages.
    * 4. Declared count of records in DefaultRecordBatch must match number of valid records contained therein.
    *
+   * 更新 offset，并且做进一步的验证，包括：
+   * 1. 启用了 compaction的 topic 的消息，必须包含 key
+   * 2. 当 magic >= 1 时，如果内部的消息是压缩过的，他们的 offset 必须是从 0 开始递增的
+   * 3. 当 magic >= 1 时，校验或修正时间戳
+   * 4. DefaultRecordBatch 中声明的 records 数量必须与实际数量一致
+   *
    * This method will convert messages as necessary to the topic's configured message format version. If no format
    * conversion or value overwriting is required for messages, this method will perform in-place operations to
    * avoid expensive re-compression.
    *
+   * 这个方法会将消息转换为 topic 的配置的 message format 版本。
+   * 如果不需要格式转换或值覆盖(消息的 magic 和 kafka 配置的 magic 不一致)，则此方法将执行原地操作以避免 re-compression 的开销
+   *
    * Returns a ValidationAndOffsetAssignResult containing the validated message set, maximum timestamp, the offset
    * of the shallow message with the max timestamp and a boolean indicating whether the message sizes may have changed.
+   *
+   * 返回一个 ValidationAndOffsetAssignResult，
+   * 其中包含已验证的消息集，最大时间戳，具有最大时间戳的浅层消息的 offset，以及一个指示消息大小是否更改的布尔值。
    */
   private[log] def validateMessagesAndAssignOffsets(records: MemoryRecords,
                                                     topicPartition: TopicPartition,

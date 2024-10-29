@@ -44,9 +44,11 @@ import scala.math._
  * 日志的 segment。每个 segment 都有两个组件：日志和索引。
  * 日志是一个包含实际消息的 FileRecords。
  * 索引是一个将逻辑偏移映射到物理文件位置的 OffsetIndex 。
- * 每个 segment 都有一个基础偏移 base_offset，它小于当前 segment 中所有消息的最小偏移，并且大于之前所有 segment 的偏移。
+ * 每个 segment 都有一个基础偏移 base_offset，它小于当前 segment 中所有消息的最小偏移,
+ * 并且大于之前所有 segment 的偏移。
  *
- * A segment with a base offset of [base_offset] would be stored in two files, a [base_offset].index and a [base_offset].log file.
+ * A segment with a base offset of [base_offset] would be stored in two files,
+ * a [base_offset].index and a [base_offset].log file.
  *
  * segment 信息会被存在两个文件中，即：
  * [base_offset].index
@@ -58,7 +60,9 @@ import scala.math._
  * @param txnIndex The transaction index
  * @param baseOffset A lower bound on the offsets in this segment
  * @param indexIntervalBytes The approximate number of bytes between entries in the index:
- *                           对应 Broker 端参数 log.index.interval.bytes。默认情况下，日志段至少新写入 4KB 的消息数据才会新增一条索引项。
+ *                           对应 Broker 端参数 log.index.interval.bytes。默认情况下，
+ *                           日志段至少新写入 4KB 的消息数据才会新增一条索引项；假如你写入了一条
+ *                           大小为 200KB 的消息，那么会立刻增加一条索引。
  * @param rollJitterMs The maximum random jitter subtracted from the scheduled segment roll time
  *                     随机时间差，每个新增日志段在创建时会彼此岔开一小段时间，这样可以降低物理磁盘的 I/O 负载。
  * @param time The time instance
@@ -147,7 +151,7 @@ class LogSegment private[log] (val log: FileRecords,
    * 将内存中的 MemoryRecords append 到 log 文件中
    *
    * It is assumed this method is being called from within a lock.
-   * 假定这个方法是在 lock 中执行
+   * 这个方法是需要在 lock 中执行的
    *
    * @param largestOffset               The last offset in the message set
    *                                    message set 中最后一条消息的 offset
@@ -175,6 +179,7 @@ class LogSegment private[log] (val log: FileRecords,
       ensureOffsetInRange(largestOffset)
 
       // append the messages
+      // 向 LogSegment 的 FileRecords 中 append MemoryRecords
       // 注意一个 FileRecords 中，最多保存 Int.Max bytes 的数据，如果超了，这一步会抛出 IllegalArgumentException
       val appendedBytes = log.append(records)
       trace(s"Appended $appendedBytes to ${log.file} at end offset $largestOffset")
@@ -191,9 +196,10 @@ class LogSegment private[log] (val log: FileRecords,
       // append an entry to the index (if needed)
       // 日志段至少新写入 indexIntervalBytes 的消息数据才会新增一条索引项
       if (bytesSinceLastIndexEntry > indexIntervalBytes) {
-        // physicalPosition: 当前日志总 Bytes
-        // largestOffset: message set 中最后一条消息的 offset。注意这里实际是转化成了 relative offset。
-        // 这两个数字，会以两个 Int 的形式 append 到 offsetIndex 中，这对应着 offsetIndex 中的 entrySize = 8Bytes
+        // physicalPosition: append 之前日志的总 Bytes
+        // largestOffset: message set 中最后一条消息的 offset。注意这里 largestOffset 是它在整个分区中的绝对 offset，
+        // 增加索引的时候，实际记录的是这条 log 在 segment 中的 relative offset，还有它在文件中的物理位置
+        // 这两个数字，会以两个 Int 的形式 append 到 offsetIndex 中，这对应着 offsetIndex 中的每一个 entry 的 Size = 8Bytes
         offsetIndex.append(largestOffset, physicalPosition)
         // 只有本次的 ts 和 offset 都比上一次的大的时候，才会真正 append
         // 这两个数字，会以一个 Int 一个 Long 的形式 append 到 timeIndex 中，这对应着 timeIndex 中的 entrySize = 12Bytes
@@ -316,8 +322,9 @@ class LogSegment private[log] (val log: FileRecords,
   @threadsafe
   private[log] def translateOffset(offset: Long, startingFilePosition: Int = 0): LogOffsetPosition = {
 
-    // 根据要读取的 startOffset，找到 offset，和它的 physical position
+    // 在索引中查找比 startOffset 小的 offset，和 physical position
     val mapping = offsetIndex.lookup(offset)
+
     // 如果在索引中没找到，就从文件的起始位置开始找
     // 如果在索引中找到了，就从文件的 mapping.position 位置预读文件，开始查找
     log.searchForOffsetWithSize(offset, max(mapping.position, startingFilePosition))
@@ -331,11 +338,11 @@ class LogSegment private[log] (val log: FileRecords,
    * message set 的大小可以通过 maxSize bytes 和 maxOffset(maxPosition) 来限制。
    *
    * @param startOffset   A lower bound on the first offset to include in the message set we read
-   *                      消息的 offset
+   *                      消息的相对 offset
    * @param maxSize       The maximum number of bytes to include in the message set we read
    * @param maxPosition   The maximum position in the log segment that should be exposed for read
    * @param minOneMessage If this is true, the first message will be returned even if it exceeds `maxSize` (if one exists)
-   *                      是否允许在消息体过大时，至少返回一条消息，防止消费者永远空转
+   *                      至少返回一条消息（即便超过了 maxSize 的限制）
    *
    * @return The fetched data and the offset metadata of the first message whose offset is >= startOffset,
    *         or null if the startOffset is larger than the largest offset in this log
@@ -348,6 +355,9 @@ class LogSegment private[log] (val log: FileRecords,
     if (maxSize < 0)
       throw new IllegalArgumentException(s"Invalid max size $maxSize for log read from segment $log")
 
+    // 这里首先去查索引，调用了上面介绍过的 offsetIndex.lookup 方法，得到索引对应的 absolute offset 和 physical position
+    // 但是索引并不一定对应着我们要查找的消息本身，所以会再去根据索引对应的消息为起点，去 log 文件中，按照 batch 遍历整个
+    // log 文件，最终查找到一个 batch 的消息，这个 batch 是以 offset、position、byteSize 标识的
     val startOffsetAndSize = translateOffset(startOffset)
 
     // if the start position is already off the end of the log, return null
@@ -386,7 +396,8 @@ class LogSegment private[log] (val log: FileRecords,
    * Run recovery on the given segment. This will rebuild the index from the log file and lop off any invalid bytes
    * from the end of the log and index.
    *
-   * 加载 segment: Broker 在启动时会从磁盘上加载所有日志段信息到内存中，并创建 LogSegment 对象实例
+   * recovery segment: Broker 在启动时会从磁盘上加载所有日志段信息到内存中，并创建 LogSegment 对象实例
+   * 会根据 log 文件重建所有的 index 文件，并砍掉 log 和 index 末尾的无效 Bytes
    *
    * @param producerStateManager Producer state corresponding to the segment's base offset. This is needed to recover
    *                             the transaction index.
@@ -405,7 +416,7 @@ class LogSegment private[log] (val log: FileRecords,
     maxTimestampSoFar = RecordBatch.NO_TIMESTAMP
 
     try {
-      // 以 FileChannelRecordBatch 维度遍历所有的 segment
+      // 以 FileChannelRecordBatch 维度遍历 segment
       for (batch <- log.batches.asScala) {
         // 校验 batch 的 header 的元数据长度是否正确，CRC32校验码是否正确
         batch.ensureValid()
