@@ -102,15 +102,20 @@ public class Schema extends Type {
         for (int i = 0; i < fields.length; i++) {
             try {
                 if (tolerateMissingFieldsWithDefaults) {
+                    // 允许字段缺省
                     if (buffer.hasRemaining()) {
+                        // 根据字段类型，从 buffer 中读取数据
                         objects[i] = fields[i].def.type.read(buffer);
                     } else if (fields[i].def.hasDefaultValue) {
+                        // 如果 buffer 中没数据了，但是字段有默认值，就用默认值
                         objects[i] = fields[i].def.defaultValue;
                     } else {
+                        // 如果 buffer 中没数据了，但是字段没有默认值，就报错
                         throw new SchemaException("Missing value for field '" + fields[i].def.name +
                                 "' which has no default value.");
                     }
                 } else {
+                    // 不允许缺省的情况，直接从 buffer 读数据
                     objects[i] = fields[i].def.type.read(buffer);
                 }
             } catch (Exception e) {

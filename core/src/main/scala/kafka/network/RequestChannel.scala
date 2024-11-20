@@ -76,6 +76,15 @@ object RequestChannel extends Logging {
     }
   }
 
+  /**
+   *
+   * @param processor      是 Processor 线程的序号，即这个请求是由哪个 Processor 线程接收处理的。
+   * @param context        context 是用来标识请求上下文信息的
+   * @param startTimeNanos 记录了 Request 对象被创建的时间，主要用于各种时间统计指标的计算
+   * @param memoryPool     一个非阻塞式的内存缓冲区，主要作用是避免 Request 对象无限使用内存
+   * @param buffer         保存 Request 对象内容的字节缓冲区
+   * @param metrics
+   */
   class Request(val processor: Int,
                 val context: RequestContext,
                 val startTimeNanos: Long,

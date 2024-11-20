@@ -36,10 +36,10 @@ public class RequestContext implements AuthorizableRequestContext {
     public final RequestHeader header;
     public final String connectionId;
     public final InetAddress clientAddress;
-    public final KafkaPrincipal principal;
+    public final KafkaPrincipal principal;  // Kafka用户认证类，用于认证授权
     public final ListenerName listenerName;
     public final SecurityProtocol securityProtocol;
-    public final ClientInformation clientInformation;
+    public final ClientInformation clientInformation;   // 用户自定义的客户端信息
 
     public RequestContext(RequestHeader header,
                           String connectionId,
@@ -57,17 +57,27 @@ public class RequestContext implements AuthorizableRequestContext {
         this.clientInformation = clientInformation;
     }
 
+    // 从 buffer 中读数据，构建 request 对象以及 request size
     public RequestAndSize parseRequest(ByteBuffer buffer) {
         if (isUnsupportedApiVersionsRequest()) {
             // Unsupported ApiVersion requests are treated as v0 requests and are not parsed
+            // 如果是 ApiVersionsRequest 类型的请求，(其实就是客户端跟 broker 交换 api 版本信息的请求)
+            // 且 broker 不支持请求中携带的版本号，broker 会将他当做 v0 版本，并打上 unsupported 标记，
+            // 对于 unsupported ApiVersionsRequest，broker 会在 response 的时候，返回支持的 api 版本列表
             ApiVersionsRequest apiVersionsRequest = new ApiVersionsRequest(new ApiVersionsRequestData(), (short) 0, header.apiVersion());
             return new RequestAndSize(apiVersionsRequest, 0);
         } else {
             ApiKeys apiKey = header.apiKey();
             try {
                 short apiVersion = header.apiVersion();
+                // ApiKeys 中针对每种不同类型的请求，配置了多个版本的字段信息(Schema[] SCHEMAS)
+                // 这里根据请求中的 apiVersion，找到对应的 scheme
+                // 然后返回一个包含着 scheme对象 和 value数组的 Struct 对象
                 Struct struct = apiKey.parseRequest(apiVersion, buffer);
+
+                // 生成 request 实例
                 AbstractRequest body = AbstractRequest.parseRequest(apiKey, apiVersion, struct);
+
                 return new RequestAndSize(body, struct.sizeOf());
             } catch (Throwable ex) {
                 throw new InvalidRequestException("Error getting request for apiKey: " + apiKey +

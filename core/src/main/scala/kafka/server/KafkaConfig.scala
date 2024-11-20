@@ -1682,6 +1682,8 @@ class KafkaConfig(val props: java.util.Map[_, _], doLog: Boolean, dynamicConfigO
   }
 
   def controlPlaneListener: Option[EndPoint] = {
+    // 从 control.plane.listener.name 配置中，找到用户配置的 name
+    // 然后去 listeners 配置中，找到同名的 endpoint
     controlPlaneListenerName.map { listenerName =>
       listeners.filter(endpoint => endpoint.listenerName.value() == listenerName.value()).head
     }

@@ -127,6 +127,9 @@ public class Selector implements Selectable, AutoCloseable {
 
     //indicates if the previous call to poll was able to make progress in reading already-buffered data.
     //this is used to prevent tight loops when memory is not available to read any more data
+    // 在 poll() 调用中，如果没有读取到新数据也没有处理任何缓冲数据(比如内存不足)，
+    // 就可能进入“无效循环”
+    // 通过这个标志位，Kafka 能够避免浪费 CPU 资源在无意义的循环中空转跑飞掉
     private boolean madeReadProgressLastPoll = true;
 
     /**
@@ -325,8 +328,16 @@ public class Selector implements Selectable, AutoCloseable {
     }
 
     protected SelectionKey registerChannel(String id, SocketChannel socketChannel, int interestedOps) throws IOException {
+
+        // 将 channel 注册到 selector 中，返回代表这个 channel 的 SelectionKey
         SelectionKey key = socketChannel.register(nioSelector, interestedOps);
+
+        // 生成 KafkaChannel 对象，
+        // 然后通过 SelectionKey.attach(obj) 方法，将 KafkaChannel 绑定给 SelectionKey
+        // 后续可以通过 SelectionKey.attachment() 取回绑定的 KafkaChannel
         KafkaChannel channel = buildAndAttachKafkaChannel(socketChannel, id, key);
+
+        // 放到 channel map 中
         this.channels.put(id, channel);
         if (idleExpiryManager != null)
             idleExpiryManager.update(channel.id(), time.nanoseconds());
@@ -385,12 +396,16 @@ public class Selector implements Selectable, AutoCloseable {
      */
     public void send(Send send) {
         String connectionId = send.destination();
+
+        // 如果 channel 不在 channelMap 或者 closingChannelMap 中，则抛出异常
         KafkaChannel channel = openOrClosingChannelOrFail(connectionId);
+
         if (closingChannels.containsKey(connectionId)) {
             // ensure notification via `disconnected`, leave channel in the state in which closing was triggered
             this.failedSends.add(connectionId);
         } else {
             try {
+                // 将 send 绑定到 channel 中
                 channel.setSend(send);
             } catch (Exception e) {
                 // update the state for consistency, the channel will be discarded after `close`
@@ -411,10 +426,17 @@ public class Selector implements Selectable, AutoCloseable {
      * Do whatever I/O can be done on each connection without blocking. This includes completing connections, completing
      * disconnections, initiating new sends, or making progress on in-progress sends or receives.
      *
+     * 在不阻塞的情况下，对每个连接执行可以完成的所有 I/O 操作。
+     * 这包括完成连接、完成断开连接、启动新的发送操作，或处理正在进行的发送或接收操作。
+     *
      * When this call is completed the user can check for completed sends, receives, connections or disconnects using
      * {@link #completedSends()}, {@link #completedReceives()}, {@link #connected()}, {@link #disconnected()}. These
      * lists will be cleared at the beginning of each `poll` call and repopulated by the call if there is
      * any completed I/O.
+     *
+     * 当此调用完成后，用户可以通过 completedSends()、completedReceives()、#connected() 和 disconnected()
+     * 来检查已完成的发送、接收、连接或断开连接。这些列表会在每次 `poll` 调用的开始时被清空，
+     * 并在调用期间重新填充（如果有任何已完成的 I/O 操作）。
      *
      * In the "Plaintext" setting, we are using socketChannel to read & write to the network. But for the "SSL" setting,
      * we encrypt the data before we use socketChannel to write data to the network, and decrypt before we return the responses.
@@ -426,10 +448,31 @@ public class Selector implements Selectable, AutoCloseable {
      * buffers. If there are channels with buffered data that can by processed, we set "timeout" to 0 and process the data even
      * if there is no more data to read from the socket.
      *
+     * 在“Plaintext”模式下，我们使用 `socketChannel` 与网络进行读写。
+     * 但在“SSL”模式下，我们在使用 `socketChannel` 将数据写入网络之前对数据进行加密，并在返回响应之前对数据进行解密。
+     * 由于网络上传输的数据是加密的，我们无法按照 Kafka 协议要求的精确字节数读取，
+     * 因此需要维护额外的缓冲区来从网络读取数据。
+     *
+     * 我们会尽可能多地读取字节，最多读取到 `SSLEngine` 的应用缓冲区大小。
+     * 这意味着我们可能会读取比请求的大小更多的字节。
+     *
+     * 如果从 `socketChannel` 中没有更多数据可读，则 selector 不会再调用该通道，
+     * 但缓冲区中可能还有额外的数据。
+     *
+     * 为了解决这个问题，我们添加了一个名为 "keysWithBufferedRead" 的映射，
+     * 用于跟踪在 SSL 缓冲区中有数据的通道。如果存在可以处理缓冲数据的通道，
+     * 我们将 `timeout` 设置为 0，即使 `socketChannel` 中没有更多数据可读，我们也会处理这些数据。
+     *
      * Atmost one entry is added to "completedReceives" for a channel in each poll. This is necessary to guarantee that
      * requests from a channel are processed on the broker in the order they are sent. Since outstanding requests added
      * by SocketServer to the request queue may be processed by different request handler threads, requests on each
      * channel must be processed one-at-a-time to guarantee ordering.
+     *
+     * 每次 `poll` 中，每个通道最多只有一个条目被添加到 "completedReceives" 列表中。
+     * 这是为了保证来自某个通道的请求在 broker 上按照发送顺序被处理。
+     * 由于 `SocketServer` 添加到请求队列的未完成请求可能由不同的请求处理线程处理，
+     * 为保证顺序性，每个通道的请求必须一次只能处理一个。
+     *
      *
      * @param timeout The amount of time to wait, in milliseconds, which must be non-negative
      * @throws IllegalArgumentException If `timeout` is negative
@@ -441,35 +484,68 @@ public class Selector implements Selectable, AutoCloseable {
         if (timeout < 0)
             throw new IllegalArgumentException("timeout should be >= 0");
 
+        // 在 poll() 调用中，如果没有读取到新数据也没有处理任何缓冲数据就可能进入“无效循环”
+        // 通过这个标志位，Kafka 能够避免浪费 CPU 资源在无意义的循环中空转跑飞掉
         boolean madeReadProgressLastCall = madeReadProgressLastPoll;
+
+        // 清理缓存和标记位，为本轮 poll 做准备
+        // this.madeReadProgressLastPoll = false;
+        // this.completedSends.clear();
+        // this.completedReceives.clear();
+        // this.connected.clear();
+        // this.disconnected.clear();
+        // this.failedSends.remove(xxxxx);
+        // this.disconnected.put(xxxxx, ChannelState.FAILED_SEND);
+        // this.failedSends.clear();
         clear();
 
+        // 对于 PlaintextTransportLayer 不存在这种情况
+        // 对于 SslTransportLayer，底层传输数据的时候，上一轮 poll 的时候，
+        // 可能有数据遗留在 SSLEngine 的应用缓冲区中，本轮 poll 的时候需要去处理这些数据
         boolean dataInBuffers = !keysWithBufferedRead.isEmpty();
 
         if (!immediatelyConnectedKeys.isEmpty() || (madeReadProgressLastCall && dataInBuffers))
             timeout = 0;
 
+        // 在调用 KafkaChannel 的 read 方法时，会先构建 NetworkReceive 对象，
+        // 然后调用 NetworkReceive.readFrom() 方法，这个方法在读取数据的时候，会先申请内存，
+        // 此时如果申请失败，则表示内存压力较大，会先静音通道，然后设置 outOfMemory = True
+        //
+        // 这里检测如果 channel 处于 outOfMemory 状态，但是内存池中有空余了，
+        // 则说明内存压力已经消退了
         if (!memoryPool.isOutOfMemory() && outOfMemory) {
+
             //we have recovered from memory pressure. unmute any channel not explicitly muted for other reasons
             log.trace("Broker no longer low on memory - unmuting incoming sockets");
             for (KafkaChannel channel : channels.values()) {
+
+                // 如果 channel 处于静音状态，但是 channel 没有明确的被设置为静音，
+                // 则解除静音状态
                 if (channel.isInMutableState() && !explicitlyMutedChannels.contains(channel)) {
                     channel.maybeUnmute();
                 }
             }
+
+            // 内存压力消退，解除 outOfMemory 状态
             outOfMemory = false;
         }
 
         /* check ready keys */
         long startSelect = time.nanoseconds();
+
+        // 调用底层 nioSelector 的 select/selectNow 方法
         int numReadyKeys = select(timeout);
+
         long endSelect = time.nanoseconds();
         this.sensors.selectTime.record(endSelect - startSelect, time.milliseconds());
 
+        // 有东西可读
         if (numReadyKeys > 0 || !immediatelyConnectedKeys.isEmpty() || dataInBuffers) {
             Set<SelectionKey> readyKeys = this.nioSelector.selectedKeys();
 
             // Poll from channels that have buffered data (but nothing more from the underlying socket)
+            // 上一轮 poll 的时候，由于内存不足或其他原因，有数据积压在 SslEngine 缓冲区的数据。
+            // 如果本轮 poll 还是拉不到数据，就放回到 keysWithBufferedRead 中，等下一轮再 poll 处理
             if (dataInBuffers) {
                 keysWithBufferedRead.removeAll(readyKeys); //so no channel gets polled twice
                 Set<SelectionKey> toPoll = keysWithBufferedRead;
@@ -478,6 +554,7 @@ public class Selector implements Selectable, AutoCloseable {
             }
 
             // Poll from channels where the underlying socket has more data
+            // 处理 SelectionKeys 上所有处于 ready 状态的 IO 操作
             pollSelectionKeys(readyKeys, false, endSelect);
             // Clear all selected keys so that they are included in the ready count for the next select
             readyKeys.clear();
@@ -485,6 +562,7 @@ public class Selector implements Selectable, AutoCloseable {
             pollSelectionKeys(immediatelyConnectedKeys, true, endSelect);
             immediatelyConnectedKeys.clear();
         } else {
+            // 没有东西可读
             madeReadProgressLastPoll = true; //no work is also "progress"
         }
 
@@ -492,10 +570,20 @@ public class Selector implements Selectable, AutoCloseable {
         this.sensors.ioTime.record(endIo - endSelect, time.milliseconds());
 
         // Close channels that were delayed and are now ready to be closed
+        //
+        // 上面执行 pollSelectionKeys 的时候，会调用 channel.prepare()
+        // 完成传输层连接和 authenticate 身份验证，如果身份验证失败(authenticator.authenticate())，
+        // 会记录失败的 channel 到 delayedClosingChannels 中
+        //
+        // 这里是去尝试关闭这些 channel
+        //
+        // 身份验证：对于 PLAINTEXT 和 SSL 其实是没有额外的认证工作的，而对于 SASL_PLAINTEXT 和 SASL_SSL
+        //         则需要执行 SASL 验证
         completeDelayedChannelClose(endIo);
 
         // we use the time at the end of select to ensure that we don't close any connections that
         // have just been processed in pollSelectionKeys
+        // 遍历 lru map，关闭空闲时间超过 connections.max.idle.ms 的连接
         maybeCloseOldestConnection(endSelect);
     }
 
@@ -509,6 +597,10 @@ public class Selector implements Selectable, AutoCloseable {
     void pollSelectionKeys(Set<SelectionKey> selectionKeys,
                            boolean isImmediatelyConnected,
                            long currentTimeNanos) {
+        // determineHandlingOrder()
+        // 如果内存濒临耗尽，则用 Collections.shuffle 将列表打乱，
+        // 避免所有连接都阻塞在某一个大的 read() 上
+        // 如果内存充足，就什么也不做
         for (SelectionKey key : determineHandlingOrder(selectionKeys)) {
             KafkaChannel channel = channel(key);
             long channelStartTimeNanos = recordTimePerConnection ? time.nanoseconds() : 0;
@@ -516,7 +608,11 @@ public class Selector implements Selectable, AutoCloseable {
             String nodeId = channel.id();
 
             // register all per-connection metrics at once
+            // 注册 metrics，如 request-size-avg、.bytes-received、.latency 等
             sensors.maybeRegisterConnectionMetrics(nodeId);
+
+            // 通过 linkedHashMap 实现了一个 lru 缓存，
+            // 统计空闲时间超过 connections.max.idle.ms 的 connectionId
             if (idleExpiryManager != null)
                 idleExpiryManager.update(nodeId, currentTimeNanos);
 
@@ -539,10 +635,25 @@ public class Selector implements Selectable, AutoCloseable {
                 }
 
                 /* if channel is not ready finish prepare */
+                //
+                // 连接已经建立
+                // isConnected = socketChannel.isConnected()
+                // 但是尚未 ready(握手尚未完成、安全协议尚未校验等)
+                // ready = transportLayer.ready() && authenticator.complete()
+                // 需要做前置的校验工作
+                //
+                // (对于 PlaintextTransportLayer，read 永远等于 true，不需要走这段逻辑
+                //  对于其他协议，比如 SaslClientAuthenticator，则可能走这段逻辑)
                 if (channel.isConnected() && !channel.ready()) {
+
+                    // 上面没握完的手，这里握
+                    // 上面没做完的身份验证，这里验
                     channel.prepare();
+
                     if (channel.ready()) {
                         long readyTimeMs = time.milliseconds();
+
+                        // 成功通过验证的次数；只有当 re-authentication 功能开启的时候，才可能会大于 1
                         boolean isReauthentication = channel.successfulAuthentications() > 1;
                         if (isReauthentication) {
                             sensors.successfulReauthentication.record(1.0, readyTimeMs);
@@ -561,6 +672,8 @@ public class Selector implements Selectable, AutoCloseable {
                             "re-" : "", channel.socketDescription());
                     }
                 }
+
+
                 if (channel.ready() && channel.state() == ChannelState.NOT_CONNECTED)
                     channel.state(ChannelState.READY);
                 Optional<NetworkReceive> responseReceivedDuringReauthentication = channel.pollResponseReceivedDuringReauthentication();
@@ -576,13 +689,24 @@ public class Selector implements Selectable, AutoCloseable {
                     attemptRead(channel);
                 }
 
+                // 对于 PlaintextTransportLayer 不存在这种情况
+                // 对于 SslTransportLayer，底层传输数据的时候，buffer 中可能有数据尚未读完
                 if (channel.hasBytesBuffered()) {
+
                     //this channel has bytes enqueued in intermediary buffers that we could not read
                     //(possibly because no memory). it may be the case that the underlying socket will
                     //not come up in the next poll() and so we need to remember this channel for the
                     //next poll call otherwise data may be stuck in said buffers forever. If we attempt
                     //to process buffered data and no progress is made, the channel buffered status is
                     //cleared to avoid the overhead of checking every time.
+                    //
+                    // 当 Kafka 从网络中读取数据时，数据可能先被存储在通道的中间缓冲区中，而不是直接传递给应用程序。
+                    // 这可能是由于内存不足或其他原因，导致无法处理所有读取到的数据。
+                    // 如果缓冲区中有数据且未被处理，下次调用 poll() 时，底层套接字可能不会触发任何事件（例如 READ 事件）。
+                    // 这会导致数据长时间滞留在缓冲区中，无法被读取。
+                    //
+                    // 这里记录一下这个 key，下一轮 poll(其实就是 nioSelector.select())的时候继续处理。
+                    //
                     keysWithBufferedRead.add(key);
                 }
 
@@ -590,6 +714,9 @@ public class Selector implements Selectable, AutoCloseable {
 
                 long nowNanos = channelStartTimeNanos != 0 ? channelStartTimeNanos : currentTimeNanos;
                 try {
+                    // 判断:
+                    // send != null && channel.ready() && key.isWritable() && 客户端session未过期
+                    // 然后底层调用 nio 包下的 GatheringByteChannel.write 方法写数据
                     attemptWrite(key, channel, nowNanos);
                 } catch (Exception e) {
                     sendFailed = true;
@@ -641,15 +768,24 @@ public class Selector implements Selectable, AutoCloseable {
     // package-private for testing
     void write(KafkaChannel channel) throws IOException {
         String nodeId = channel.id();
+
+        // 调用 nio 包下的 GatheringByteChannel.write 方法写数据
         long bytesSent = channel.write();
+
+        // 如果 bytes/records 都已经发送了，则返回 Send 对象，否则返回 null
         Send send = channel.maybeCompleteSend();
+
         // We may complete the send with bytesSent < 1 if `TransportLayer.hasPendingWrites` was true and `channel.write()`
         // caused the pending writes to be written to the socket channel buffer
+        //
+        // 看提交记录，这里是修了个 bug，当数据发送到底层 sslEngine 的 netWriteBuffer 中时，就认为他已经发送成功了
         if (bytesSent > 0 || send != null) {
             long currentTimeMs = time.milliseconds();
             if (bytesSent > 0)
                 this.sensors.recordBytesSent(nodeId, bytesSent, currentTimeMs);
             if (send != null) {
+
+                // send 成功之后，将记录添加到 completedSends 列表中
                 this.completedSends.add(send);
                 this.sensors.recordCompletedSend(nodeId, send.size(), currentTimeMs);
             }
@@ -659,6 +795,8 @@ public class Selector implements Selectable, AutoCloseable {
     private Collection<SelectionKey> determineHandlingOrder(Set<SelectionKey> selectionKeys) {
         //it is possible that the iteration order over selectionKeys is the same every invocation.
         //this may cause starvation of reads when memory is low. to address this we shuffle the keys if memory is low.
+        //
+        // 如果内存濒临耗尽，则将 selectionKeys 列表打乱，避免所有连接都阻塞在某一个大的 read() 上
         if (!outOfMemory && memoryPool.availableMemory() < lowMemThreshold) {
             List<SelectionKey> shuffledKeys = new ArrayList<>(selectionKeys);
             Collections.shuffle(shuffledKeys);
@@ -671,12 +809,17 @@ public class Selector implements Selectable, AutoCloseable {
     private void attemptRead(KafkaChannel channel) throws IOException {
         String nodeId = channel.id();
 
+        // 从 buffer 中读数据
+        // 读数据的时候，会调用 memoryPool.tryAllocate 申请内存，
+        // 如果内存不足，则不会接收数据，并且会静音通道(mute())
         long bytesReceived = channel.read();
         if (bytesReceived != 0) {
             long currentTimeMs = time.milliseconds();
             sensors.recordBytesReceived(nodeId, bytesReceived, currentTimeMs);
             madeReadProgressLastPoll = true;
 
+
+            // 如果 buffer 中的数据全都读完了，则添加到 CompletedReceives map 中
             NetworkReceive receive = channel.maybeCompleteReceive();
             if (receive != null) {
                 addToCompletedReceives(channel, receive, currentTimeMs);
@@ -912,14 +1055,32 @@ public class Selector implements Selectable, AutoCloseable {
      * requested. For other values of `closeMode`, outstanding receives are discarded and the channel
      * is closed immediately.
      *
+     * 关闭连接
+     * 如果 closeMode == CloseMode.GRACEFUL，将会在这里断开 channel 的连接，但会处理完所有的 receive。
+     * 当没有未完成的 receives 或者有 send 请求时，channel 会被关闭。
+     *
+     * 对于其他 closeMode 的情况，未完成的 receives 会被丢弃，channel 会被立即关闭。
+     *
      * The channel will be added to disconnect list when it is actually closed if `closeMode.notifyDisconnect`
      * is true.
+     *
+     * 如果 closeMode.notifyDisconnect == true，当 channel 被实际关闭时， channel 会被添加到 disconnect 列表中
      */
     private void close(KafkaChannel channel, CloseMode closeMode) {
+        // 在 KafkaChannel 中标记 disconnected = true
+        // 调用底层 selectionKey.cancel() 断开连接
         channel.disconnect();
 
         // Ensure that `connected` does not have closed channels. This could happen if `prepare` throws an exception
         // in the `poll` invocation when `finishConnect` succeeds
+        //
+        // 确保 connectedMap 中不包含已关闭的 channel。
+        //
+        // 在 poll 方法中，首先根据 selectionKey 找到 KafkaChannel，然后调用 KafkaChannel 的 finishConnect()
+        // 当调用成功时（即底层的 SocketChannel 连接成功），就会将 connectionId 放到 connected map 中，
+        // 接下来，会校验链接是否建立成功（传输层是否完成握手，安全协议验证是否通过），
+        // 如果上述步骤尚未完成，会去调用 prepare() 方法完成这些准备工作，
+        // 这一步是有可能抛出异常，比如安全协议验证失败等，所以这一需要清理掉
         connected.remove(channel.id());
 
         // Keep track of closed channels with pending receives so that all received records
@@ -928,12 +1089,23 @@ public class Selector implements Selectable, AutoCloseable {
         // handle close(). When the remote end closes its connection, the channel is retained until
         // a send fails or all outstanding receives are processed. Mute state of disconnected channels
         // are tracked to ensure that requests are processed one-by-one by the broker to preserve ordering.
+        //
+        // 当生产者设置 acks=0 并发送一些记录后关闭其连接时，broker 中的一次 poll() 可能会接收到记录并处理关闭操作。
+        // 当远程端关闭其连接时，该通道会被保留，直到发送操作失败或所有未完成的接收请求被处理完。
+        // 对于断开连接的通道，会追踪其静音状态，以确保 broker 能按顺序逐一处理请求，从而保持请求的顺序性。
+        //
+        // CloseMode.GRACEFUL 时 Kafka 会继续追踪此连接上未完成的接收请求，以便让这些请求有机会处理完毕。
+        // Kafka 会尝试从 channel buffer 中读取数据，如果读到了数据，就将 channel 添加到
+        // completed receives map 中去
+        // 然后将 channel 标记为 closing 状态(放到 closing channel map 中)
         if (closeMode == CloseMode.GRACEFUL && maybeReadFromClosingChannel(channel)) {
             closingChannels.put(channel.id(), channel);
             log.debug("Tracking closing connection {} to process outstanding requests", channel.id());
         } else {
             doClose(channel, closeMode.notifyDisconnect);
         }
+
+        // 清理 channel map
         this.channels.remove(channel.id());
 
         if (delayedClosingChannels != null)

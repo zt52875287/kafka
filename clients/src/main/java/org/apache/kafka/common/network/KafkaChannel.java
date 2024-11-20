@@ -126,6 +126,8 @@ public class KafkaChannel implements AutoCloseable {
     private Send send;
     // Track connection and mute state of channels to enable outstanding requests on channels to be
     // processed after the channel is disconnected.
+    //
+    // 追踪连接状态以及 mute state，当 channel is disconnected 的时候，仍然能正确处理未完成的 requests
     private boolean disconnected;
     private ChannelMuteState muteState;
     private ChannelState state;
@@ -163,6 +165,9 @@ public class KafkaChannel implements AutoCloseable {
 
     /**
      * Does handshake of transportLayer and authentication using configured authenticator.
+     *
+     * 传输层握手，并做身份验证
+     *
      * For SSL with client authentication enabled, {@link TransportLayer#handshake()} performs
      * authentication. For SASL, authentication is performed by {@link Authenticator#authenticate()}.
      */
@@ -396,6 +401,10 @@ public class KafkaChannel implements AutoCloseable {
 
         long bytesReceived = receive(this.receive);
 
+        // 如果待接收数据的大小已知 (receive 对象中 requestedBufferSize 已知)
+        // 且 receive 对象中 buffer 尚未初始化
+        // (说明在 receive.readFrom 方法中，调用 memoryPool.tryAllocate 分配内存失败了)
+        // 则表示内存不足，这时候需要静音通道
         if (this.receive.requiredMemoryAmountKnown() && !this.receive.memoryAllocated() && isInMutableState()) {
             //pool must be out of memory, mute ourselves.
             mute();
