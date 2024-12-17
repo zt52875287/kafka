@@ -56,6 +56,7 @@ class ControllerChannelManager(controllerContext: ControllerContext,
                                threadNamePrefix: Option[String] = None) extends Logging with KafkaMetricsGroup {
   import ControllerChannelManager._
 
+  // 保存着所有 broker 的信息
   protected val brokerStateInfo = new HashMap[Int, ControllerBrokerStateInfo]
   private val brokerLock = new Object
   this.logIdent = "[Channel manager on controller " + config.brokerId + "]: "
@@ -110,12 +111,18 @@ class ControllerChannelManager(controllerContext: ControllerContext,
   }
 
   private def addNewBroker(broker: Broker): Unit = {
+
+    // 为每一个 broker 创建一个单独的消息队列
     val messageQueue = new LinkedBlockingQueue[QueueItem]
     debug(s"Controller ${config.brokerId} trying to connect to broker ${broker.id}")
     val controllerToBrokerListenerName = config.controlPlaneListenerName.getOrElse(config.interBrokerListenerName)
     val controllerToBrokerSecurityProtocol = config.controlPlaneSecurityProtocol.getOrElse(config.interBrokerSecurityProtocol)
+
+    // 根据 listenerName 拿到 broker node 信息（host、port 等）
     val brokerNode = broker.node(controllerToBrokerListenerName)
     val logContext = new LogContext(s"[Controller id=${config.brokerId}, targetBrokerId=${brokerNode.idString}] ")
+
+    // 单独为 controller request 创建一个 networkClient
     val (networkClient, reconfigurableChannelBuilder) = {
       val channelBuilder = ChannelBuilders.clientChannelBuilder(
         controllerToBrokerSecurityProtocol,
@@ -129,6 +136,7 @@ class ControllerChannelManager(controllerContext: ControllerContext,
       )
       val reconfigurableChannelBuilder = channelBuilder match {
         case reconfigurable: Reconfigurable =>
+          // 如果 channel 是支持热更新的，加入到 kafka 管理中
           config.addReconfigurable(reconfigurable)
           Some(reconfigurable)
         case _ => None
@@ -169,16 +177,19 @@ class ControllerChannelManager(controllerContext: ControllerContext,
       case Some(name) => s"$name:Controller-${config.brokerId}-to-broker-${broker.id}-send-thread"
     }
 
+    // 如果 channel 是支持热更新的，加入到 kafka 管理中
     val requestRateAndQueueTimeMetrics = newTimer(
       RequestRateAndQueueTimeMetricName, TimeUnit.MILLISECONDS, TimeUnit.SECONDS, brokerMetricTags(broker.id)
     )
 
+    // 创建消费者线程
     val requestThread = new RequestSendThread(config.brokerId, controllerContext, messageQueue, networkClient,
       brokerNode, config, time, requestRateAndQueueTimeMetrics, stateChangeLogger, threadName)
     requestThread.setDaemon(false)
 
     val queueSizeGauge = newGauge(QueueSizeMetricName, () => messageQueue.size, brokerMetricTags(broker.id))
 
+    // 保存 broker 信息
     brokerStateInfo.put(broker.id, ControllerBrokerStateInfo(networkClient, brokerNode, messageQueue,
       requestThread, queueSizeGauge, requestRateAndQueueTimeMetrics, reconfigurableChannelBuilder))
   }
@@ -240,21 +251,32 @@ class RequestSendThread(val controllerId: Int,
     try {
       var isSendSuccessful = false
       while (isRunning && !isSendSuccessful) {
+
         // if a broker goes down for a long time, then at some point the controller's zookeeper listener will trigger a
         // removeBroker which will invoke shutdown() on this thread. At that point, we will stop retrying.
+        // 如果 broker 挂了一段时间，那么 controller 的 zookeeper listener 会调用 removeBroker 方法，
+        // 这个方法会调用当前类的 shutdown() 方法，标记为线程关闭状态，此时，我们就终止重试。
+
         try {
+          // 与 broker 的连接没有建立成功，尝试重连
           if (!brokerReady()) {
+            // 等了一段时间，连接还是没有建立成功
             isSendSuccessful = false
+            // 等待看看是不是当前线程正在关闭
+            // 内部调用的是 shutdownInitiated.await(timeout, unit)，防止循环跑飞了
             backoff()
           }
           else {
+            // 构建请求
             val clientRequest = networkClient.newClientRequest(brokerNode.idString, requestBuilder,
               time.milliseconds(), true)
+
+            // 发送请求
             clientResponse = NetworkClientUtils.sendAndReceive(networkClient, clientRequest, time)
             isSendSuccessful = true
           }
         } catch {
-          case e: Throwable => // if the send was not successful, reconnect to broker and resend the message
+          case e: Throwable =>
             warn(s"Controller $controllerId epoch ${controllerContext.epoch} fails to send request $requestBuilder " +
               s"to broker $brokerNode. Reconnecting to broker.", e)
             networkClient.close(brokerNode.idString)
@@ -262,7 +284,11 @@ class RequestSendThread(val controllerId: Int,
             backoff()
         }
       }
+
+      // 发送成功
       if (clientResponse != null) {
+
+        // 确保响应的请求类型是 leaderAndIsr, stopReplica, updateMetadata
         val requestHeader = clientResponse.requestHeader
         val api = requestHeader.apiKey
         if (api != ApiKeys.LEADER_AND_ISR && api != ApiKeys.STOP_REPLICA && api != ApiKeys.UPDATE_METADATA)
@@ -274,6 +300,7 @@ class RequestSendThread(val controllerId: Int,
           s"${response.toString(requestHeader.apiVersion)} for request $api with correlation id " +
           s"${requestHeader.correlationId} sent to broker $brokerNode")
 
+        // 回调
         if (callback != null) {
           callback(response)
         }

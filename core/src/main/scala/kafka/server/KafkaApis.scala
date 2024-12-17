@@ -1771,50 +1771,82 @@ class KafkaApis(val requestChannel: RequestChannel,
     }
 
     val createTopicsRequest = request.body[CreateTopicsRequest]
+
+    // 待创建的 topic 列表对象
     val results = new CreatableTopicResultCollection(createTopicsRequest.data.topics.size)
+
+    // 如果当前 broker 不是 controller (activeControllerId != config.brokerId)
     if (!controller.isActive) {
+      // 只有 controller 可以创建 topic，返回错误
       createTopicsRequest.data.topics.forEach { topic =>
         results.add(new CreatableTopicResult().setName(topic.name)
           .setErrorCode(Errors.NOT_CONTROLLER.code))
       }
+      // 返回结果给客户端
       sendResponseCallback(results)
+
     } else {
+
+      // 构造 result list
       createTopicsRequest.data.topics.forEach { topic =>
         results.add(new CreatableTopicResult().setName(topic.name))
       }
+
+      // 检查是否具有集群级别的 create 权限
       val hasClusterAuthorization = authorize(request.context, CREATE, CLUSTER, CLUSTER_NAME,
         logIfDenied = false)
+
+      // 筛选出可创建的 topic 列表
       val topics = createTopicsRequest.data.topics.asScala.map(_.name)
-      val authorizedTopics =
+      val authorizedTopics = {
+        // 具有集群级别的 create 权限，原封不动返回 topics 列表
         if (hasClusterAuthorization) topics.toSet
+        // 筛选出具备 CREATE TOPIC 权限的主题
         else filterByAuthorized(request.context, CREATE, TOPIC, topics)(identity)
+      }
+
+      // 筛选出具备 DESCRIBE_CONFIGS 权限的主题
       val authorizedForDescribeConfigs = filterByAuthorized(request.context, DESCRIBE_CONFIGS, TOPIC,
         topics, logIfDenied = false)(identity).map(name => name -> results.find(name)).toMap
 
+
       results.forEach { topic =>
         if (results.findAll(topic.name).size > 1) {
+          // 标记重名的 topic
           topic.setErrorCode(Errors.INVALID_REQUEST.code)
           topic.setErrorMessage("Found multiple entries for this topic.")
+
         } else if (!authorizedTopics.contains(topic.name)) {
+          // 标记无权限的 topic
           topic.setErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
           topic.setErrorMessage("Authorization failed.")
         }
+
+        // 标记没有 DESCRIBE_CONFIGS 权限的 topic
         if (!authorizedForDescribeConfigs.contains(topic.name)) {
           topic.setTopicConfigErrorCode(Errors.TOPIC_AUTHORIZATION_FAILED.code)
         }
       }
+
+      // 筛选出可以创建的主题，存储在 toCreate 中
       val toCreate = mutable.Map[String, CreatableTopic]()
       createTopicsRequest.data.topics.forEach { topic =>
         if (results.find(topic.name).errorCode == Errors.NONE.code) {
           toCreate += topic.name -> topic
         }
       }
+
+      // 处理创建结果的回调函数
       def handleCreateTopicsResults(errors: Map[String, ApiError]): Unit = {
         errors.forKeyValue { (topicName, error) =>
+
+          // 根据 adminManager.createTopics 的结果更新每个主题的创建状态
           val result = results.find(topicName)
           result.setErrorCode(error.error.code)
             .setErrorMessage(error.message)
+
           // Reset any configs in the response if Create failed
+          // 如果某主题创建失败，清空其配置，设置错误码和消息
           if (error != ApiError.NONE) {
             result.setConfigs(List.empty.asJava)
               .setNumPartitions(-1)
@@ -1822,8 +1854,12 @@ class KafkaApis(val requestChannel: RequestChannel,
               .setTopicConfigErrorCode(Errors.NONE.code)
           }
         }
+
+        // 返回结果给客户端
         sendResponseCallback(results)
       }
+
+      // 创建 topic
       adminManager.createTopics(
         createTopicsRequest.data.timeoutMs,
         createTopicsRequest.data.validateOnly,
@@ -3291,11 +3327,20 @@ class KafkaApis(val requestChannel: RequestChannel,
                                         createResponse: Int => AbstractResponse,
                                         onComplete: Option[Send => Unit]): Unit = {
     val timeMs = time.milliseconds
+
     val controllerThrottleTimeMs = controllerMutationQuota.throttleTime
     val requestThrottleTimeMs = quotas.request.maybeRecordAndGetThrottleTimeMs(request, timeMs)
+
+    // 被限流: 客户端在收到 Broker 的响应后会发现包含一个 throttle_time_ms 字段，客户端会在下次请求中等待该时间
     val maxThrottleTimeMs = Math.max(controllerThrottleTimeMs, requestThrottleTimeMs)
+
+
     if (maxThrottleTimeMs > 0) {
+
+      // 记录请求的 throttle_time_ms
       request.apiThrottleTimeMs = maxThrottleTimeMs
+
+
       if (controllerThrottleTimeMs > requestThrottleTimeMs) {
         quotas.controllerMutation.throttle(request, controllerThrottleTimeMs, requestChannel.sendResponse)
       } else {

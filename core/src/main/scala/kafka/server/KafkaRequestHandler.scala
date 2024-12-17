@@ -54,24 +54,44 @@ class KafkaRequestHandler(id: Int,
       // Since meter is calculated as total_recorded_value / time_window and
       // time_window is independent of the number of threads, each recorded idle
       // time should be discounted by # threads.
+      //
+      // 跟踪线程池的总空闲时间比例
+      // Meter 的值是通过 total_recorded_value / time_window 计算的
+      // 其中:
+      // total_recorded_value 是总的记录值。
+      // time_window 是一个时间窗口，独立于线程数量。
+      //
+      // 因为这个指标是测量线程池中所有线程的整体空闲情况，而不是单个线程的。
+      // 所以要除以线程数，对每个线程的空闲时间进行折算，照线程总数进行平摊。
+      // 这样可以提供一个更准确的度量，显示线程池的整体闲置率，而不是单个线程的状态。
       val startSelectTime = time.nanoseconds
 
+      // 其实就是从 RequestChannel 的 requestQueue 中取出一个请求
       val req = requestChannel.receiveRequest(300)
+
       val endTime = time.nanoseconds
       val idleTime = endTime - startSelectTime
+
+      // 当前线程的空闲时间/线程数 进行折算
       aggregateIdleMeter.mark(idleTime / totalHandlerThreads.get)
 
       req match {
+
+        // 如果是 shutdown 请求，则退出
         case RequestChannel.ShutdownRequest =>
           debug(s"Kafka request handler $id on broker $brokerId received shut down command")
           shutdownComplete.countDown()
           return
 
+        // 正常的 request
         case request: RequestChannel.Request =>
           try {
             request.requestDequeueTimeNanos = endTime
             trace(s"Kafka request handler $id on broker $brokerId handling request $request")
+
+            // 调用 KafkaApi 类去处理业务逻辑
             apis.handle(request)
+
           } catch {
             case e: FatalExitError =>
               shutdownComplete.countDown()
@@ -105,11 +125,16 @@ class KafkaRequestHandlerPool(val brokerId: Int,
                               requestHandlerAvgIdleMetricName: String,
                               logAndThreadNamePrefix : String) extends Logging with KafkaMetricsGroup {
 
+  // 线程池大小，由配置文件中的 num.io.threads 控制
+  // 这个参数是支持动态调整的，因此是一个 AtomicInteger 类
   private val threadPoolSize: AtomicInteger = new AtomicInteger(numThreads)
+
   /* a meter to track the average free capacity of the request handlers */
   private val aggregateIdleMeter = newMeter(requestHandlerAvgIdleMetricName, "percent", TimeUnit.NANOSECONDS)
 
   this.logIdent = "[" + logAndThreadNamePrefix + " Kafka Request Handler on Broker " + brokerId + "], "
+
+  // 负责保存子线程，即 KafkaRequestHandler 线程
   val runnables = new mutable.ArrayBuffer[KafkaRequestHandler](numThreads)
   for (i <- 0 until numThreads) {
     createHandler(i)
@@ -137,10 +162,15 @@ class KafkaRequestHandlerPool(val brokerId: Int,
 
   def shutdown(): Unit = synchronized {
     info("shutting down")
-    for (handler <- runnables)
+    for (handler <- runnables) {
+      // 向 RequestChannel.requestQueue() 中塞一个 ShutdownRequest
       handler.initiateShutdown()
-    for (handler <- runnables)
+    }
+    for (handler <- runnables) {
+      // 这里会阻塞， 直到 KafkaRequestHandler 读到 ShutdownRequest 的时候，
+      // 并 shutdown 自己为止
       handler.awaitShutdown()
+    }
     info("shut down completely")
   }
 }

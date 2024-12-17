@@ -109,12 +109,20 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
 
     // Read /controller_epoch to get the current controller epoch and zkVersion,
     // create /controller_epoch with initial value if not exists
+    //
+    // 从 /controller_epoch 读数据
     val (curEpoch, curEpochZkVersion) = getControllerEpoch
       .map(e => (e._1, e._2.getVersion))
+      // 如果节点不存在，则创建节点，
+      // 如果创建成功，就会将 epoch 初始化为 0
+      // 如果创建失败，报错提示节点已存在，则说明有人抢先了，再读一次数据并返回
       .getOrElse(maybeCreateControllerEpochZNode())
+
 
     // Create /controller and update /controller_epoch atomically
     val newControllerEpoch = curEpoch + 1
+
+    // 当前 zk 的数据版本作为基准
     val expectedControllerEpochZkVersion = curEpochZkVersion
 
     debug(s"Try to create ${ControllerZNode.path} and increment controller epoch to $newControllerEpoch with expected controller epoch zkVersion $expectedControllerEpochZkVersion")
@@ -123,7 +131,12 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
       val curControllerId = getControllerId.getOrElse(throw new ControllerMovedException(
         s"The ephemeral node at ${ControllerZNode.path} went away while checking whether the controller election succeeds. " +
           s"Aborting controller startup procedure"))
+
+      // 如果 /controller 节点里的 id 就是当前节点的 broker id
+      // 则说明当前节点时 controller
       if (controllerId == curControllerId) {
+
+        // 查询 controller epoch
         val (epoch, stat) = getControllerEpoch.getOrElse(
           throw new IllegalStateException(s"${ControllerEpochZNode.path} existed before but goes away while trying to read it"))
 
@@ -131,6 +144,12 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
         // is associated with the current broker during controller election because we already knew that the zk
         // transaction succeeds based on the controller znode verification. Other rounds of controller
         // election will result in larger epoch number written in zk.
+        //
+        // epoch 也对得上，可以断定返回的 epoch zkVersion 是和当前 broker 相关联的
+        // 因为之前通过验证 controller 节点（controller znode）已经确认 ZooKeeper 的事务成功了
+        // 如果有其他 broker 成为 controller（新的选举轮次），它们在 ZooKeeper 中写入的 epoch 一定会比当前的更大
+        //
+        // id 对得上，epoch 也对得上，说明选举成功
         if (epoch == newControllerEpoch)
           return (newControllerEpoch, stat.getVersion)
       }
@@ -138,16 +157,30 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
     }
 
     def tryCreateControllerZNodeAndIncrementEpoch(): (Int, Int) = {
+
       val response = retryRequestUntilConnected(
         MultiRequest(Seq(
+          // 先尝试去创建 /controller 节点，并写入当前 brokerId
           CreateOp(ControllerZNode.path, ControllerZNode.encode(controllerId, timestamp), defaultAcls(ControllerZNode.path), CreateMode.EPHEMERAL),
+          // 然后去更新 /controller_epoch 的值
           SetDataOp(ControllerEpochZNode.path, ControllerEpochZNode.encode(newControllerEpoch), expectedControllerEpochZkVersion)))
       )
+
+      // 对于 multi-request，这里返回的是第一个请求的结果
       response.resultCode match {
+
+        // 创建 /controller 请求执行失败，说明节点已存在，这里去读取并验证节点里的数据，
+        // 如果 epoch 和 version 都正确，则说明写入成功了，直接返回
+        // 如果没有对上，说明当前节点选举失败了，会直接抛出异常，终止逻辑
         case Code.NODEEXISTS | Code.BADVERSION => checkControllerAndEpoch()
+
+        // 创建请求执行成功
         case Code.OK =>
+          // 找到 set 请求的执行结果
           val setDataResult = response.zkOpResults(1).rawOpResult.asInstanceOf[SetDataResult]
+          // 返回新的 epoch 和 version
           (newControllerEpoch, setDataResult.getStat.getVersion)
+
         case code => throw KeeperException.create(code)
       }
     }
@@ -1697,10 +1730,16 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
 
   private def retryRequestsUntilConnected[Req <: AsyncRequest](requests: Seq[Req], expectedControllerZkVersion: Int): Seq[Req#Response] = {
     expectedControllerZkVersion match {
+
+      // 对 controller_epoch 无要求，则直接发送请求
       case ZkVersion.MatchAnyVersion => retryRequestsUntilConnected(requests)
+
+      // 如果要求校验版本号，则将 request 包装成 muti-request
+      // 先去校验 controller_epoch，再去执行真正的请求
       case version if version >= 0 =>
         retryRequestsUntilConnected(requests.map(wrapRequestWithControllerEpochCheck(_, version)))
           .map(unwrapResponseWithControllerEpochCheck(_).asInstanceOf[Req#Response])
+
       case invalidVersion =>
         throw new IllegalArgumentException(s"Expected controller epoch zkVersion $invalidVersion should be non-negative or equal to ${ZkVersion.MatchAnyVersion}")
     }
