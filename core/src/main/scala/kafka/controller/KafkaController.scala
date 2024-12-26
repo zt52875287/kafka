@@ -267,6 +267,10 @@ class KafkaController(val config: KafkaConfig,
 
     // 初始化 topicDelete 状态机
     info("Fetching topic deletions in progress")
+    // topicsToBeDeleted: 查询 /admin/delete_topics 下的 topic_name 列表，获取所有待删除的 topic
+    // topicsIneligibleForDeletion:
+    //     上述主题列表中，有主题正在执行 partition reassignment 或者
+    //     持有该 topic 某个 replica 的 broker 宕机了
     val (topicsToBeDeleted, topicsIneligibleForDeletion) = fetchTopicDeletionsInProgress()
     info("Initializing topic deletion manager")
     topicDeletionManager.init(topicsToBeDeleted, topicsIneligibleForDeletion)
@@ -539,6 +543,11 @@ class KafkaController(val config: KafkaConfig,
    * 3. It checks whether there are reassigned replicas assigned to any newly started brokers. If
    *    so, it performs the reassignment logic for each topic/partition.
    *
+   * 这个方法是 controller 在检测到新的 broker 启动后执行的回调逻辑：
+   * 1. 向其他 broker 发送更新集群的元数据的请求，告知有新 broker 加入
+   * 2. 确保新 broker 能正确承载其分配的分区及副本
+   * 3. 检查是否有需要恢复的 分区重分配任务 或 主题删除任务。
+   *
    * Note that we don't need to refresh the leader/isr cache for all topic/partitions at this point for two reasons:
    * 1. The partition state machine, when triggering online state change, will refresh leader and ISR for only those
    *    partitions currently new or offline (rather than every partition this controller is aware of)
@@ -547,29 +556,53 @@ class KafkaController(val config: KafkaConfig,
    */
   private def onBrokerStartup(newBrokers: Seq[Int]): Unit = {
     info(s"New broker startup callback for ${newBrokers.mkString(",")}")
+
+    // 从离线列表中移除新 broker 相关的分区副本
+    // (因为这些副本之前可能由于 broker 下线被标记为离线)
     newBrokers.foreach(controllerContext.replicasOnOfflineDirs.remove)
+
     val newBrokersSet = newBrokers.toSet
     val existingBrokers = controllerContext.liveOrShuttingDownBrokerIds.diff(newBrokersSet)
+
     // Send update metadata request to all the existing brokers in the cluster so that they know about the new brokers
     // via this update. No need to include any partition states in the request since there are no partition state changes.
+    //
+    // 向现有 broker 发送更新元数据请求，告诉他们有 broker 加入
     sendUpdateMetadataRequest(existingBrokers.toSeq, Set.empty)
+
     // Send update metadata request to all the new brokers in the cluster with a full set of partition states for initialization.
     // In cases of controlled shutdown leaders will not be elected when a new broker comes up. So at least in the
     // common controlled shutdown case, the metadata will reach the new brokers faster.
+    //
+    // 向新 broker 发送更新元数据请求，包含集群完整的分区状态，用于初始化。
     sendUpdateMetadataRequest(newBrokers, controllerContext.partitionsWithLeaders)
+
     // the very first thing to do when a new broker comes up is send it the entire list of partitions that it is
     // supposed to host. Based on that the broker starts the high watermark threads for the input list of partitions
+    //
+    // 当一个新 broker 加入集群的时候，第一件要做的事，
+    // 就是告诉他他所负责的 partition 信息并将它设置为 online
+    // 这样，新 broker 就可以为这些 partition 创建 hw 来处理数据了
     val allReplicasOnNewBrokers = controllerContext.replicasOnBrokers(newBrokersSet)
     replicaStateMachine.handleStateChanges(allReplicasOnNewBrokers.toSeq, OnlineReplica)
+
     // when a new broker comes up, the controller needs to trigger leader election for all new and offline partitions
     // to see if these brokers can become leaders for some/all of those
+    //
+    // 当新 broker 加入集群，controller 需要在受影响的 partition 上触发选举操作
     partitionStateMachine.triggerOnlinePartitionStateChange()
+
     // check if reassignment of some partitions need to be restarted
+    //
+    // 重启之前暂停的副本迁移操作
     maybeResumeReassignments { (_, assignment) =>
       assignment.targetReplicas.exists(newBrokersSet.contains)
     }
+
     // check if topic deletion needs to be resumed. If at least one replica that belongs to the topic being deleted exists
     // on the newly restarted brokers, there is a chance that topic deletion can resume
+    //
+    // 检查是否有需要删除的主题，其副本分布在重启的 broker 上。如果存在，则恢复对应的主题删除操作
     val replicasForTopicsToBeDeleted = allReplicasOnNewBrokers.filter(p => topicDeletionManager.isTopicQueuedUpForDeletion(p.topic))
     if (replicasForTopicsToBeDeleted.nonEmpty) {
       info(s"Some replicas ${replicasForTopicsToBeDeleted.mkString(",")} for topics scheduled for deletion " +
@@ -577,6 +610,9 @@ class KafkaController(val config: KafkaConfig,
         s"${newBrokers.mkString(",")}. Signaling restart of topic deletion for these topics")
       topicDeletionManager.resumeDeletionForTopics(replicasForTopicsToBeDeleted.map(_.topic))
     }
+
+    // 为新启动的 broker 注册修改监听器，监听 /brokers/ids/xxx 节点
+    // 确保后续 broker 配置的变更能被及时检测和处理
     registerBrokerModificationsHandler(newBrokers)
   }
 
@@ -610,14 +646,22 @@ class KafkaController(val config: KafkaConfig,
    */
   private def onBrokerFailure(deadBrokers: Seq[Int]): Unit = {
     info(s"Broker failure callback for ${deadBrokers.mkString(",")}")
+
+    // broker 离线，需要清理掉 replica 记录
     deadBrokers.foreach(controllerContext.replicasOnOfflineDirs.remove)
+
+    // 从“关闭ing”列表移除
     val deadBrokersThatWereShuttingDown =
       deadBrokers.filter(id => controllerContext.shuttingDownBrokerIds.remove(id))
     if (deadBrokersThatWereShuttingDown.nonEmpty)
       info(s"Removed ${deadBrokersThatWereShuttingDown.mkString(",")} from list of shutting down brokers.")
+
+    // 从 ctx 中，找出离线 broker 上保存的副本(replica)
     val allReplicasOnDeadBrokers = controllerContext.replicasOnBrokers(deadBrokers.toSet)
+    // 关闭离线的副本
     onReplicasBecomeOffline(allReplicasOnDeadBrokers)
 
+    // 注销对 /brokers/ids/xxx 的监听器
     unregisterBrokerModificationsHandler(deadBrokers)
   }
 
@@ -632,6 +676,13 @@ class KafkaController(val config: KafkaConfig,
     * 2. Triggers the OnlinePartition state change for all new/offline partitions
     * 3. Invokes the OfflineReplica state change on the input list of newly offline replicas
     * 4. If no partitions are affected then send UpdateMetadataRequest to live or shutting down brokers
+    *
+    * 将 replicas 设置为 offline:
+    * 1. 将 replicas 标记为 offline:
+    *
+    *
+    *
+    *
     *
     * Note that we don't need to refresh the leader/isr cache for all topic/partitions at this point. This is because
     * the partition state machine will refresh our cache for us when performing leader election for all new/offline
@@ -1421,6 +1472,7 @@ class KafkaController(val config: KafkaConfig,
     }
   }
 
+  //
   private def processTopicDeletionStopReplicaResponseReceived(replicaId: Int,
                                                               requestError: Errors,
                                                               partitionErrors: Map[TopicPartition, Errors]): Unit = {
@@ -1434,8 +1486,11 @@ class KafkaController(val config: KafkaConfig,
       partitionErrors.filter { case (_, error) => error != Errors.NONE }.keySet
 
     val replicasInError = partitionsInError.map(PartitionAndReplica(_, replicaId))
-    // move all the failed replicas to ReplicaDeletionIneligible
+
+    // 通过 replica 状态机将 replica 状态设置为 ReplicaDeletionIneligible
+    // 然后通过 resumeDeletions 方法重新尝试删除
     topicDeletionManager.failReplicaDeletion(replicasInError)
+
     if (replicasInError.size != partitionErrors.size) {
       // some replicas could have been successfully deleted
       val deletedReplicas = partitionErrors.keySet.diff(partitionsInError)
@@ -1615,6 +1670,12 @@ class KafkaController(val config: KafkaConfig,
    *  - The second map contains only those brokers whose features were found to be incompatible with
    *    the existing finalized features.
    *
+   * Finalized feature 是 Kafka 中的一种特性管理机制，用于在集群中协商和管理版本化的特性 (features)。
+   * Kafka 集群中的节点可能运行不同的 Kafka 版本，每个版本支持不同的特性集合。
+   * 为了确保集群中所有节点可以正常协作，Kafka 引入了 finalized feature 的概念。
+   * Finalized feature 表示已经在集群范围内协商并达成一致的特性版本。这些特性是全局启用的，
+   * 所有节点都需要支持且遵守这些特性。
+   *
    * @param brokersAndEpochs   the map to be partitioned
    * @return                   two maps: first contains compatible brokers and second contains
    *                           incompatible brokers as explained above
@@ -1633,15 +1694,31 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def processBrokerChange(): Unit = {
+
+    // activeControllerId != config.brokerId
+    // 如果当前节点不是 controller，直接退出
     if (!isActive) return
+
+    /**
+     * 查询 zk 中的 brokerId，和 controller context 中的进行对比
+     */
+    // 查询 broker 信息，以 map<brokerInfo, czxid> 的形式返回
+    // czxid 表示创建该 ZNode 的事务 ID，它是单调递增且全局唯一的，可以帮助确认 broker 注册的顺序
     val curBrokerAndEpochs = zkClient.getAllBrokerAndEpochsInCluster
     val curBrokerIdAndEpochs = curBrokerAndEpochs map { case (broker, epoch) => (broker.id, epoch) }
     val curBrokerIds = curBrokerIdAndEpochs.keySet
+
+    // 取出 ctx 中保存的 broker 列表
     val liveOrShuttingDownBrokerIds = controllerContext.liveOrShuttingDownBrokerIds
+
+    // 正反手对比 zk 上的数据和 ctx 中的数据，拿到新加入的 brokerId 和失效的 brokerId
     val newBrokerIds = curBrokerIds.diff(liveOrShuttingDownBrokerIds)
     val deadBrokerIds = liveOrShuttingDownBrokerIds.diff(curBrokerIds)
+
+    // 在 id 交集中，取出 czxid 发生变化的 brokerId
     val bouncedBrokerIds = (curBrokerIds & liveOrShuttingDownBrokerIds)
       .filter(brokerId => curBrokerIdAndEpochs(brokerId) > controllerContext.liveBrokerIdAndEpochs(brokerId))
+
     val newBrokerAndEpochs = curBrokerAndEpochs.filter { case (broker, _) => newBrokerIds.contains(broker.id) }
     val bouncedBrokerAndEpochs = curBrokerAndEpochs.filter { case (broker, _) => bouncedBrokerIds.contains(broker.id) }
     val newBrokerIdsSorted = newBrokerIds.toSeq.sorted
@@ -1653,12 +1730,20 @@ class KafkaController(val config: KafkaConfig,
       s"bounced brokers: ${bouncedBrokerIdsSorted.mkString(",")}, " +
       s"all live brokers: ${liveBrokerIdsSorted.mkString(",")}")
 
+    /**
+     * 更新 controllerChannelManager 中的 broker 信息（这是和其他 broker 进行通信）
+     */
+    // 查询 broker 的最新信息，并为它创建单独的消息队列、rpc client、RequestSendThread 等
     newBrokerAndEpochs.keySet.foreach(controllerChannelManager.addBroker)
+    // 这里要先删除再增加，因为 brokerId 没有变化的情况下，broker 的其他信息是有可能发生变化的
     bouncedBrokerIds.foreach(controllerChannelManager.removeBroker)
     bouncedBrokerAndEpochs.keySet.foreach(controllerChannelManager.addBroker)
     deadBrokerIds.foreach(controllerChannelManager.removeBroker)
 
+    // 添加新 brokers
     if (newBrokerIds.nonEmpty) {
+      // 如果新加入的 broker 中，声明了某些特性，和集群中其他已有的节点不兼容，
+      // 则放弃添加这些 broker
       val (newCompatibleBrokerAndEpochs, newIncompatibleBrokerAndEpochs) =
         partitionOnFeatureCompatibility(newBrokerAndEpochs)
       if (!newIncompatibleBrokerAndEpochs.isEmpty) {
@@ -1668,6 +1753,8 @@ class KafkaController(val config: KafkaConfig,
       controllerContext.addLiveBrokers(newCompatibleBrokerAndEpochs)
       onBrokerStartup(newBrokerIdsSorted)
     }
+
+    // 重新添加 czxid 发生变化的 brokers
     if (bouncedBrokerIds.nonEmpty) {
       controllerContext.removeLiveBrokers(bouncedBrokerIds)
       onBrokerFailure(bouncedBrokerIdsSorted)
@@ -1680,6 +1767,8 @@ class KafkaController(val config: KafkaConfig,
       controllerContext.addLiveBrokers(bouncedCompatibleBrokerAndEpochs)
       onBrokerStartup(bouncedBrokerIdsSorted)
     }
+
+    // 删除 dead brokers
     if (deadBrokerIds.nonEmpty) {
       controllerContext.removeLiveBrokers(deadBrokerIds)
       onBrokerFailure(deadBrokerIdsSorted)
@@ -1691,15 +1780,24 @@ class KafkaController(val config: KafkaConfig,
   }
 
   private def processBrokerModification(brokerId: Int): Unit = {
+    // 只有 controller 有权限处理此任务
     if (!isActive) return
+
     val newMetadataOpt = zkClient.getBroker(brokerId)
     val oldMetadataOpt = controllerContext.liveOrShuttingDownBroker(brokerId)
+
     if (newMetadataOpt.nonEmpty && oldMetadataOpt.nonEmpty) {
       val oldMetadata = oldMetadataOpt.get
       val newMetadata = newMetadataOpt.get
+
+      // endpoint 发生变化，或者 features 发生变化
       if (newMetadata.endPoints != oldMetadata.endPoints || !oldMetadata.features.equals(newMetadata.features)) {
         info(s"Updated broker metadata: $oldMetadata -> $newMetadata")
+
+        // 更新 ctx
         controllerContext.updateBrokerMetadata(oldMetadata, newMetadata)
+
+        // 向存活的 broker 们发送 update metadata request
         onBrokerUpdate(brokerId)
       }
     }
@@ -1707,21 +1805,50 @@ class KafkaController(val config: KafkaConfig,
 
   private def processTopicChange(): Unit = {
     if (!isActive) return
+
+    // 查询所有的 topics
     val topics = zkClient.getAllTopicsInCluster(true)
+
+    // 找到新增的 topic 和删除的 topic
     val newTopics = topics -- controllerContext.allTopics
     val deletedTopics = controllerContext.allTopics.diff(topics)
+
+    // 更新 ctx
     controllerContext.setAllTopics(topics)
 
+    // 注册监听器，监听 /brokers/topics/[topic] 的变更
     registerPartitionModificationsHandlers(newTopics.toSeq)
+
+    // 查询新 /brokers/topics/[topic] 中的数据
+    // 节点里面的数据长这样:
+    // {
+    //    "version": 2,
+    //    "partitions": {
+    //        "0":[0,1], "1":[2,0], "2":[1,2]
+    //    },
+    //    "adding_replicas": {},
+    //    "removing_replicas": {}
+    // }
     val addedPartitionReplicaAssignment = zkClient.getFullReplicaAssignmentForTopics(newTopics)
+
+    // 清理 ctx 中失效的 topic:
+    // controller 执行删除 topic 任务时，会从 /brokers/topics 中删除对应的 topic
+    // (这部分 topic 属于是 deletedTopic)，从而触发 TopicChange 监听器，
+    // 这里需要将这部分 topic 删掉
     deletedTopics.foreach(controllerContext.removeTopic)
+
+    // 更新 ctx 中的 replica 分配信息: map<broker_id, ReplicaAssignment>
     addedPartitionReplicaAssignment.foreach {
       case (topicAndPartition, newReplicaAssignment) => controllerContext.updatePartitionFullReplicaAssignment(topicAndPartition, newReplicaAssignment)
     }
     info(s"New topics: [$newTopics], deleted topics: [$deletedTopics], new partition replica assignment " +
       s"[$addedPartitionReplicaAssignment]")
-    if (addedPartitionReplicaAssignment.nonEmpty)
+
+    if (addedPartitionReplicaAssignment.nonEmpty) {
+      // 更新状态机，先将新建的 partition 设置为 NewPartition，
+      // 完成初始化之后，再设置为 OnlinePartition
       onNewPartitionCreation(addedPartitionReplicaAssignment.keySet)
+    }
   }
 
   private def processLogDirEventNotification(): Unit = {
@@ -1782,18 +1909,27 @@ class KafkaController(val config: KafkaConfig,
 
   private def processTopicDeletion(): Unit = {
     if (!isActive) return
+
+    // 当前的删除方法，就是给 /admin/delete_topics 下追加待删除的 topic name
     var topicsToBeDeleted = zkClient.getTopicDeletions.toSet
     debug(s"Delete topics listener fired for topics ${topicsToBeDeleted.mkString(",")} to be deleted")
+
+    // 如果 topic 不存在，则直接删除 /admin/delete_topics 下对应的 topic name 即可
     val nonExistentTopics = topicsToBeDeleted -- controllerContext.allTopics
     if (nonExistentTopics.nonEmpty) {
       warn(s"Ignoring request to delete non-existing topics ${nonExistentTopics.mkString(",")}")
       zkClient.deleteTopicDeletions(nonExistentTopics.toSeq, controllerContext.epochZkVersion)
     }
+
+
     topicsToBeDeleted --= nonExistentTopics
     if (config.deleteTopicEnable) {
+
       if (topicsToBeDeleted.nonEmpty) {
         info(s"Starting topic deletion for topics ${topicsToBeDeleted.mkString(",")}")
+
         // mark topic ineligible for deletion if other state changes are in progress
+        // 如果 topic 状态不对，则记录下来，后续删除的时候会跳过
         topicsToBeDeleted.foreach { topic =>
           val partitionReassignmentInProgress =
             controllerContext.partitionsBeingReassigned.map(_.topic).contains(topic)
@@ -1801,11 +1937,12 @@ class KafkaController(val config: KafkaConfig,
             topicDeletionManager.markTopicIneligibleForDeletion(Set(topic),
               reason = "topic reassignment in progress")
         }
-        // add topic to deletion list
+
+        // 添加到待删除队列中，并触发 topicDeletionManager 的删除操作
         topicDeletionManager.enqueueTopicsForDeletion(topicsToBeDeleted)
       }
     } else {
-      // If delete topic is disabled remove entries under zookeeper path : /admin/delete_topics
+      // 如果没有启用 “删除 topic” 功能，则清空 /admin/delete_topics 下的内容
       info(s"Removing $topicsToBeDeleted since delete topic is disabled")
       zkClient.deleteTopicDeletions(topicsToBeDeleted.toSeq, controllerContext.epochZkVersion)
     }

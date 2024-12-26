@@ -213,6 +213,8 @@ class ControllerContext {
       if (includeShuttingDownBrokers) liveOrShuttingDownBrokerIds.contains(brokerId)
       else liveBrokerIds.contains(brokerId)
     }
+
+    // replicasOnOfflineDirs 表示那些无法正常响应 LeaderAndIsr 请求的 <broker, TopicPartition>
     brokerOnline && !replicasOnOfflineDirs.getOrElse(brokerId, Set.empty).contains(topicPartition)
   }
 

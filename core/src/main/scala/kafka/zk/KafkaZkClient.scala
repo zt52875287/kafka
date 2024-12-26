@@ -456,13 +456,19 @@ class KafkaZkClient private[zk] (zooKeeperClient: ZooKeeperClient, isSecure: Boo
     * @return map of broker to epoch in the cluster.
     */
   def getAllBrokerAndEpochsInCluster: Map[Broker, Long] = {
+
+    // 查询 zk 上 /brokers/ids 下面的 id 列表
     val brokerIds = getSortedBrokerList
+
+    // 查询 zk 上 /brokers/ids/[id] 节点中的数据
     val getDataRequests = brokerIds.map(brokerId => GetDataRequest(BrokerIdZNode.path(brokerId), ctx = Some(brokerId)))
     val getDataResponses = retryRequestsUntilConnected(getDataRequests)
     getDataResponses.flatMap { getDataResponse =>
       val brokerId = getDataResponse.ctx.get.asInstanceOf[Int]
       getDataResponse.resultCode match {
         case Code.OK =>
+          // 构建 BrokerInfo 信息并返回
+          // czxid 表示创建该 ZNode 的事务 ID，它是单调递增且全局唯一的，可以帮助确认 broker 注册的顺序
           Some((BrokerIdZNode.decode(brokerId, getDataResponse.data).broker, getDataResponse.stat.getCzxid))
         case Code.NONODE => None
         case _ => throw getDataResponse.resultException.get

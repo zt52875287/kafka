@@ -263,12 +263,14 @@ class KafkaApis(val requestChannel: RequestChannel,
         new StopReplicaResponseData().setErrorCode(Errors.STALE_BROKER_EPOCH.code)))
     } else {
       val partitionStates = stopReplicaRequest.partitionStates().asScala
+
       val (result, error) = replicaManager.stopReplicas(
         request.context.correlationId,
         stopReplicaRequest.controllerId,
         stopReplicaRequest.controllerEpoch,
         stopReplicaRequest.brokerEpoch,
         partitionStates)
+
       // Clear the coordinator caches in case we were the leader. In the case of a reassignment, we
       // cannot rely on the LeaderAndIsr API for this since it is only sent to active replicas.
       result.forKeyValue { (topicPartition, error) =>
@@ -317,6 +319,10 @@ class KafkaApis(val requestChannel: RequestChannel,
       sendResponseExemptThrottle(request,
         new UpdateMetadataResponse(new UpdateMetadataResponseData().setErrorCode(Errors.STALE_BROKER_EPOCH.code)))
     } else {
+
+      // 如果 state 中的 leader == LeaderAndIsr.LeaderDuringDelete，
+      // 这表示这是一个删除的请求，Kafka 从本地 metadata 快照(MetadataCache.metadataSnapshot)
+      // 中删除掉 partition(replica) 信息
       val deletedPartitions = replicaManager.maybeUpdateMetadataCache(correlationId, updateMetadataRequest)
       if (deletedPartitions.nonEmpty)
         groupCoordinator.handleDeletedPartitions(deletedPartitions)

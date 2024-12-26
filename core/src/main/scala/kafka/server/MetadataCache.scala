@@ -334,12 +334,14 @@ class MetadataCache(brokerId: Int) extends Logging {
           // per-partition logging here can be very expensive due going through all partitions in the cluster
           val tp = new TopicPartition(state.topicName, state.partitionIndex)
           if (state.leader == LeaderAndIsr.LeaderDuringDelete) {
+            // 从 快照 的 快照 中 remove 掉 partition
             removePartitionInfo(partitionStates, tp.topic, tp.partition)
             if (traceEnabled)
               stateChangeLogger.trace(s"Deleted partition $tp from metadata cache in response to UpdateMetadata " +
                 s"request sent by controller $controllerId epoch $controllerEpoch with correlation id $correlationId")
             deletedPartitions += tp
           } else {
+            // 给 快照 的 快照 中增加/更新 partition 信息
             addOrUpdatePartitionInfo(partitionStates, tp.topic, tp.partition, state)
             if (traceEnabled)
               stateChangeLogger.trace(s"Cached leader info $state for partition $tp in response to " +

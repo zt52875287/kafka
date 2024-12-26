@@ -665,6 +665,7 @@ abstract class AbstractControllerBrokerRequestBatch(config: KafkaConfig,
     stopReplicaRequestMap.clear()
   }
 
+  // 在状态
   def sendRequestsToBrokers(controllerEpoch: Int): Unit = {
     try {
       val stateChangeLog = stateChangeLogger.withControllerEpoch(controllerEpoch)

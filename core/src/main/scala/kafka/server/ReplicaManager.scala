@@ -390,6 +390,9 @@ class ReplicaManager(val config: KafkaConfig,
         }
 
       val responseMap = new collection.mutable.HashMap[TopicPartition, Errors]
+
+      // 检查 controllerEpoch 是否小于当前 controllerEpoch。
+      // 如果小于，说明请求来自旧的 controller，直接忽略并返回 STALE_CONTROLLER_EPOCH 错误
       if (controllerEpoch < this.controllerEpoch) {
         stateChangeLogger.warn(s"Ignoring StopReplica request from " +
           s"controller $controllerId with correlation id $correlationId " +
@@ -404,6 +407,10 @@ class ReplicaManager(val config: KafkaConfig,
           val deletePartition = partitionState.deletePartition
 
           getPartition(topicPartition) match {
+
+            // 在对某个 topic 的 log 目录及目录下的内容进行操作时，
+            // 发生了 IO 异常，partition 会被标记为 offline log directory
+            // 这种情况下什么也不做，返回 KAFKA_STORAGE_ERROR
             case HostedPartition.Offline =>
               stateChangeLogger.warn(s"Ignoring StopReplica request (delete=$deletePartition) from " +
                 s"controller $controllerId with correlation id $correlationId " +
@@ -411,6 +418,8 @@ class ReplicaManager(val config: KafkaConfig,
                 "partition is in an offline log directory")
               responseMap.put(topicPartition, Errors.KAFKA_STORAGE_ERROR)
 
+
+            // 分区状态正常
             case HostedPartition.Online(partition) =>
               val currentLeaderEpoch = partition.getLeaderEpoch
               val requestLeaderEpoch = partitionState.leaderEpoch
@@ -418,6 +427,12 @@ class ReplicaManager(val config: KafkaConfig,
               // a sentinel value (EpochDuringDelete) overwriting any previous epoch is used.
               // When an older version of the StopReplica request which does not contain the leader
               // epoch, a sentinel value (NoEpoch) is used and bypass the epoch validation.
+
+
+              // 检查请求的 leaderEpoch：
+              // 如果是特殊的 EpochDuringDelete 或 NoEpoch，或者比当前 leaderEpoch 更大，则认为请求合法，标记为可停止。
+              // 如果小于当前 leaderEpoch，认为请求过期，返回 FENCED_LEADER_EPOCH。
+              // 如果等于当前 leaderEpoch，记录信息但不采取进一步操作。
               if (requestLeaderEpoch == LeaderAndIsr.EpochDuringDelete ||
                   requestLeaderEpoch == LeaderAndIsr.NoEpoch ||
                   requestLeaderEpoch > currentLeaderEpoch) {
@@ -439,6 +454,7 @@ class ReplicaManager(val config: KafkaConfig,
                 responseMap.put(topicPartition, Errors.FENCED_LEADER_EPOCH)
               }
 
+            // 认为分区已经不被维护，但如果收到请求要求删除分区，将它标记为可删除
             case HostedPartition.None =>
               // Delete log and corresponding folders in case replica manager doesn't hold them anymore.
               // This could happen when topic is being deleted while broker is down and recovers.
@@ -448,12 +464,16 @@ class ReplicaManager(val config: KafkaConfig,
         }
 
         // First stop fetchers for all partitions.
+        // 停止分区的拉取数据任务
         val partitions = stoppedPartitions.keySet
         replicaFetcherManager.removeFetcherForPartitions(partitions)
         replicaAlterLogDirsManager.removeFetcherForPartitions(partitions)
 
         // Second remove deleted partitions from the partition map. Fetchers rely on the
         // ReplicaManager to get Partition's information so they must be stopped first.
+        //
+        // 从 allPartitions 中移除分区信息。
+        // 删除分区相关的度量指标。
         val deletedPartitions = mutable.Set.empty[TopicPartition]
         stoppedPartitions.forKeyValue { (topicPartition, partitionState) =>
           if (partitionState.deletePartition) {
@@ -463,6 +483,8 @@ class ReplicaManager(val config: KafkaConfig,
                   maybeRemoveTopicMetrics(topicPartition.topic)
                   // Logs are not deleted here. They are deleted in a single batch later on.
                   // This is done to avoid having to checkpoint for every deletions.
+                  //
+                  // 调用分区对象的 delete 方法进行内存清理
                   partition.delete()
                 }
 

@@ -151,13 +151,25 @@ class ZkPartitionStateMachine(config: KafkaConfig,
   ): Map[TopicPartition, Either[Throwable, LeaderAndIsr]] = {
     if (partitions.nonEmpty) {
       try {
+
+        // 确保缓存中没有未发送的请求，如果有的话会抛出异常
         controllerBrokerRequestBatch.newBatch()
+
+        // 执行状态转换
+        // 状态转换过程中，如果有以下三类请求需要发送，
+        // 1. LeaderAndIsr
+        // 2. UpdateMetadata
+        // 3. StopReplica
+        // 会先暂存起来，然后通过下文的 sendRequestsToBrokers 方法发送给其他 broker
         val result = doHandleStateChanges(
           partitions,
           targetState,
           partitionLeaderElectionStrategyOpt
         )
+
+        // 将上文暂存的请求发送给 broker
         controllerBrokerRequestBatch.sendRequestsToBrokers(controllerContext.epoch)
+
         result
       } catch {
         case e: ControllerMovedException =>
